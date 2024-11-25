@@ -1,6 +1,8 @@
 import os
 import logging
 import ask_sdk_core.utils as ask_utils
+import chromadb
+import uuid
 
 from ask_sdk_core.skill_builder import SkillBuilder
 from ask_sdk_core.dispatch_components import AbstractRequestHandler
@@ -9,7 +11,10 @@ from ask_sdk_core.handler_input import HandlerInput
 
 from ask_sdk_model import Response
 
+
+
 from openai import OpenAI
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -23,10 +28,24 @@ MODEL = "gpt-4o-mini"
 messages = [
     {
         "role": "system",
-        "content": "Você é a assistente pessoal Sibila Sínica. Responda de forma clara, concisa, direta e curta. Não tente explicar a resposta, ao menos que seja solicitada. Responda em Português do Brasil.",
+        "content": "Você é a assistente pessoal Sibila. Responda de forma clara, direta e curta. Não tente explicar a resposta, ao menos que seja solicitada. Responda em Português do Brasil.",
     }
 ]
 
+
+# Inicializa o cliente ChromaDB com armazenamento local
+client = chromadb.PersistentClient(path='./chromadb_knoledge')
+collection_name = 'knoledge'
+
+def collection() -> chromadb.Collection:
+    return client.get_or_create_collection(name=collection_name)
+
+def consultar(question: str):
+	result = collection().query(query_texts=[question], n_results=5)
+	response = ""
+	for r in result['documents'][0]:
+		response += f"{r} \n"
+	return response
 
 class LaunchRequestHandler(AbstractRequestHandler):
     def can_handle(self, handler_input):
@@ -36,9 +55,7 @@ class LaunchRequestHandler(AbstractRequestHandler):
 
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
-        speak_output = (
-            "Oi! Eu sou a Sibila Sínica, O que você gostaria de saber?"
-        )
+        speak_output = ("Oi! O que gostaria de saber?")
 
         return (
             handler_input.response_builder.speak(speak_output)
@@ -59,13 +76,28 @@ class GptQueryIntentHandler(AbstractRequestHandler):
 
         return (
             handler_input.response_builder.speak(response)
-            .ask("Você pode fazer uma nova pergunta: sair.")
+            .ask("Você pode outra pergunta.")
             .response
         )
 
 
 def generate_gpt_response(query):
     try:
+        
+        docs = consultar(query)
+        
+        query = f"""
+        User o seguinte documento como base para melhorar as respostas:
+        
+        [docs]
+        {docs}
+        
+        [pergunta]
+        Responda a seguinte pergunta com base nos documentos acima.
+        Caso não horver informção suficiente, responda com base no seu conhecimento.
+        {query}
+        """
+        
         messages.append(
             {"role": "user", "content": query},
         )
