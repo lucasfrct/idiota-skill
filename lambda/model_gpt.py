@@ -4,19 +4,12 @@ import random
 from openai import OpenAI
 from dotenv import load_dotenv
 
-import knowledgebase as KnowledgeBase 
 import mail as MailSMTP
 
 load_dotenv()
 
 messages = []
 MODEL = "gpt-4o-mini"
-
-record_actions = ["anote na memória", "fixe isso", "armazene na memória"]
-record_responses = ["Ok!", "Entendi, guardado.", "Ok, armazenado.", "Entendi, fixado."]
-
-remember_actions = ["procure na meméria por", "ache na meméria", "lembre de", "me fale sobre", "Conhece sobre"]
-remenber_responses = ["Ok!", "Entendi, guardado.", "Ok, armazenado.", "Entendi, fixado."]
 
 email_actions = ["gere um email", "criar um email", "escreva um email"]
 email_responses = ["Já enviei.", "Email enviado", "Já tá feito"]
@@ -27,7 +20,7 @@ def client_gpt()-> OpenAI:
     client = OpenAI(api_key=openai_api_key)
     return client
 
-
+# Instruçõers para o sistema
 def system_instructions():
     instruction = """
         Você é um assistente pessoal de nome Altair. 
@@ -39,14 +32,14 @@ def system_instructions():
     return { "role": "system", "content": instruction, }
 
 
-def to_ask(question: str, messages = None):
-    if messages is None:
-        messages = []
+# Fazer a pergunta
+def to_ask(question: str):
     messages.append({"role": "user", "content": question})
     response = client_gpt().chat.completions.create(model=MODEL, messages=messages, temperature=0.8)
     return response.choices[0].message.content
 
 
+# gerar resposta
 def generate_gpt_response(query: str):
     try:
         
@@ -65,16 +58,10 @@ def generate_gpt_response(query: str):
 
 def discover_the_intention(question: str):
     
-    actions = ""
+    actions = "" 
     
-    for ac in record_actions:
-        actions += f"- {ac}\n"
-        
-    for a in email_actions:
-        actions += f"- {a}\n"
-        
-    for act in remember_actions:
-        actions += f"- {act}\n"
+    for action in email_actions:
+        actions += f"- {action}\n"
         
     prompt = f"""
         /shorten
@@ -89,11 +76,6 @@ def discover_the_intention(question: str):
     response = to_ask(prompt)
     
     return response
-
-
-def action_save(question: str):  
-    KnowledgeBase.save(question)
-    return random.choice(record_responses)
 
 
 def action_email(question: str):
@@ -116,7 +98,7 @@ def action_email(question: str):
     
     instructions = f"""
         /context
-        Use uma lingugem formal de e pessial.
+        Use uma lingugem formal de e pessoal.
         Seja educado e empático.
         Remove o texto 'Assunto:'.
         Deve conte uma saudação.
@@ -133,7 +115,6 @@ def action_email(question: str):
     """
     
     email = to_ask(instructions)
-    print("Email: ", email[:30].strip())
     MailSMTP.send_email(sender_email, addressee_email, title, email)
     return f"{random.choice(email_responses)} de {sender_email} para {addressee_email}"
 
@@ -207,9 +188,10 @@ def assingn_title(email: str):
     """
     return to_ask(prompt)
 
+
 client_gpt()
 messages.append(system_instructions())
 
-# messages.append(system_instructions())
-# question = "Escreva um email para solicitações a respeita da dispensa do funcionário Jair. Envie para e o email lucasfrct@outlook.com destinado ao senhor Rafael."
-# print(action_email(question))
+messages.append(system_instructions())
+question = "Escreva um email para solicitqando dispensa do funcionário Jair. Justifique disendo que le não comparece ao trabalho faz 5 dias. Envie para e o email lucasfrct@outlook.com destinado ao senhor Rafael."
+print(action_email(question))
