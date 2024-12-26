@@ -102,7 +102,7 @@ def action_email(question: str):
     sender_email = extract_email_sender(question)
     if(sender_email == ""):
         return "Não foi possível identificar o remetente."
-    
+
     sender_name = extract_name_sender(question)
     
     title = assingn_title(question)
@@ -208,6 +208,6 @@ client_gpt()
 messages.append(system_instructions())
 
 messages.append(system_instructions())
-question = "Escreva um email para solicitqando dispensa do funcionário Jair. Justifique disendo que le não comparece ao trabalho faz 5 dias. Envie para e o email lucasfrct@outlook.com destinado ao senhor Rafael."
+question = "Escreva um email para solicitqando dispensa do funcionário Jair. Justifique dizendo que le não comparece ao trabalho faz 5 dias. Envie para o email lucasfrct@outlook.com destinado ao senhor Rafael."
 # question = "Avalie para mim quais documentos preciso para abrir uma empresa?"
 print(generate_gpt_response(question))
