@@ -5,14 +5,15 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 import mail as MailSMTP
+import time
 
 load_dotenv()
 
 messages = []
 MODEL = "gpt-4o-mini"
 
-email_actions = ["gere um email", "criar um email", "escreva um email"]
-email_responses = ["Já enviei.", "Email enviado", "Já tá feito"]
+email_actions = ["gere um email", "criar um email", "escreva um email", "faça um email", 'faz um email', 'monte uma email', 'elabore uma email', 'redija um email']
+email_responses = ["Já enviei", "Email enviado", "Já tá feito", 'Acabei de mandar', 'Envio realizado', 'Jã está na caixa de enviados']
 
 
 def client_gpt()-> OpenAI:
@@ -32,10 +33,18 @@ def system_instructions():
     return { "role": "system", "content": instruction, }
 
 
+# encontrar categoria
+def categorize(question: str):
+    response = client_gpt().chat.completions.create(model=MODEL, messages=[{"role": "assistant", "content": question}], temperature=0.5, stream=False)
+    print("CAT: ", response.choices[0].message.content)
+    return response.choices[0].message.content
+
+
 # Fazer a pergunta
 def to_ask(question: str):
     messages.append({"role": "user", "content": question})
-    response = client_gpt().chat.completions.create(model=MODEL, messages=messages, temperature=0.8)
+    response = client_gpt().chat.completions.create(model=MODEL, messages=messages, temperature=0.8, stream=False)
+    print("TO - RES: ", response.choices[0].message.content)
     return response.choices[0].message.content
 
 
@@ -43,13 +52,19 @@ def to_ask(question: str):
 def generate_gpt_response(query: str):
     try:
         
-        if any(action in discover_the_intention(query) for action in email_actions):
+        actions = "" 
+        for action in email_actions:
+            actions += f"- {action}\n"
+            
+        intention = discover_the_intention(query).strip()
+        print("Intenção: ", intention)
+        
+        if intention != "" and intention in actions:
+            print("Ação de email")
             return action_email(query)
         
-        if any(action in discover_the_intention(query) for action in record_actions):
-            return action_save(query)
-
-        reply = to_ask(query, messages)
+        print("Ação COMUM", query)
+        reply = to_ask(query)
         messages.append({ "role": "assistant", "content": f"{len(messages)}. {reply}" })
         return reply
     except Exception as e:
@@ -61,7 +76,7 @@ def discover_the_intention(question: str):
     actions = "" 
     
     for action in email_actions:
-        actions += f"- {action}\n"
+        actions += f"- {action}\n        "
         
     prompt = f"""
         /shorten
@@ -70,11 +85,9 @@ def discover_the_intention(question: str):
         Caso não encontrar uma opção, responda com texto vazio.
         As opções de categorias são:
         {actions}
-        
         Com base na seguinte pergunta, categorize: {question}
     """
-    response = to_ask(prompt)
-    
+    response = categorize(prompt)
     return response
 
 
@@ -125,11 +138,13 @@ def extract_email_addressee(question: str):
     
     prompt = f"""
         /shorten
-        Descarte o email de envio.
-        Descubra o email do destinatário expresso no texto.
-        Se não encontrar o email, retorne {addressee_email}.
-        Encontre o email do destinatário no seguinte texto: {question}
-        Retorne somente o email do destinatário.
+        Descubra o endereço do email do destinatário expresso no texto.
+        O endereço de email deve conter um dominio com @.
+        O endereço de email deve ser diferente de {addressee_email}.
+        O email pode estar perto do terecho 'envie para...', 'enviar para...', 'mandar para...'
+        Encontre o endereço de email do destinatário no seguinte texto: {question}
+        Se não encontrar o endereço de email, retorne {addressee_email}.
+        Retorne somente o endereço de email do destinatário.
     """
     return to_ask(prompt)
 
@@ -194,4 +209,5 @@ messages.append(system_instructions())
 
 messages.append(system_instructions())
 question = "Escreva um email para solicitqando dispensa do funcionário Jair. Justifique disendo que le não comparece ao trabalho faz 5 dias. Envie para e o email lucasfrct@outlook.com destinado ao senhor Rafael."
-print(action_email(question))
+# question = "Avalie para mim quais documentos preciso para abrir uma empresa?"
+print(generate_gpt_response(question))
