@@ -14,20 +14,47 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-openai_api_key = ""
+openai_api_key = "REDACTED_OPENAI_API_KEY"
 
-client = OpenAI(api_key=openai_api_key)
 
+messages = []
 MODEL = "gpt-4o-mini"
 
-messages = [
-    {
-        "role": "system",
-        "content": "Você é a assistente pessoal Sibila Sínica. Responda de forma clara, concisa, direta e curta. Não tente explicar a resposta, ao menos que seja solicitada. Responda em Português do Brasil.",
-    }
-]
 
 
+
+def client_gpt()-> OpenAI:
+    client = OpenAI(api_key=openai_api_key)
+    return client
+
+
+# Instruçõers para o sistema
+def system_instructions():
+    instruction = """
+        Você é um assistente pessoal de nome Astra. 
+        Responda de forma, direta e curta. 
+        Responda em Português do Brasil.
+        Não tente explicar sua resposta.
+        Não repita a pergunda feita.
+    """
+    return { "role": "system", "content": instruction, }
+
+
+def generate_gpt_response(query):
+    try:
+        messages.append(
+            {"role": "user", "content": query},
+        )
+        response = client_gpt().chat.completions.create(
+            model=MODEL, messages=messages, max_tokens=700, temperature=0.8
+        )
+        reply = response.choices[0].message.content
+        messages.append({"role": "assistant", "content": reply})
+        return reply
+    except Exception as e:
+        return f"Erro ao gerar resposta: {str(e)}"
+        
+    
 class LaunchRequestHandler(AbstractRequestHandler):
     def can_handle(self, handler_input):
         # type: (HandlerInput) -> bool
@@ -36,9 +63,7 @@ class LaunchRequestHandler(AbstractRequestHandler):
 
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
-        speak_output = (
-            "Oi! Eu sou a Sibila Sínica, O que você gostaria de saber?"
-        )
+        speak_output = ("Oi!")
 
         return (
             handler_input.response_builder.speak(speak_output)
@@ -62,21 +87,6 @@ class GptQueryIntentHandler(AbstractRequestHandler):
             .ask("Você pode fazer uma nova pergunta: sair.")
             .response
         )
-
-
-def generate_gpt_response(query):
-    try:
-        messages.append(
-            {"role": "user", "content": query},
-        )
-        response = client.chat.completions.create(
-            model=MODEL, messages=messages, max_tokens=700, temperature=0.8
-        )
-        reply = response.choices[0].message.content
-        messages.append({"role": "assistant", "content": reply})
-        return reply
-    except Exception as e:
-        return f"Erro ao gerar resposta: {str(e)}"
 
 
 class HelpIntentHandler(AbstractRequestHandler):
@@ -139,6 +149,8 @@ class CatchAllExceptionHandler(AbstractExceptionHandler):
             .response
         )
 
+
+messages.append(system_instructions())
 
 sb = SkillBuilder()
 
