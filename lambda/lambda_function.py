@@ -14,7 +14,7 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-openai_api_key = "REDACTED_OPENAI_API_KEY"
+openai_api_key = ""
 
 
 messages = []
