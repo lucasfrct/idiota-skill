@@ -22,17 +22,27 @@
           "slots": [
             {
               "name": "query",
-              "type": "AMAZON.Person"
+              "type": "AMAZON.SearchQuery"
             }
           ],
           "name": "GptQueryIntent",
           "samples": [
-            "{query}"
+            "{query}",
+            "pergunte {query}",
+            "me diga {query}",
+            "responda {query}",
+            "explique {query}",
+            "qual é {query}",
+            "como {query}",
+            "o que é {query}",
+            "me fale sobre {query}",
+            "você sabe {query}",
+            "pode me explicar {query}"
           ]
         }
       ],
       "types": [],
-      "invocationName": "Altair"
+      "invocationName": "altair"
     }
   }
 }
