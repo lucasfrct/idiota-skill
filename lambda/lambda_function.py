@@ -10,20 +10,25 @@ from ask_sdk_core.handler_input import HandlerInput
 from ask_sdk_model import Response
 
 from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-openai_api_key = ""
-
-
+# Global variables
 messages = []
 MODEL = "gpt-4o-mini"
 
 
-
-
-def client_gpt()-> OpenAI:
+def client_gpt() -> OpenAI:
+    """Initialize OpenAI client with API key from environment variables"""
+    openai_api_key = os.getenv('OPENAI_API_KEY') or os.getenv('KEY_GPT')
+    if not openai_api_key:
+        raise ValueError("OpenAI API key not found in environment variables")
+    
     client = OpenAI(api_key=openai_api_key)
     return client
 
@@ -31,28 +36,40 @@ def client_gpt()-> OpenAI:
 # Instruçõers para o sistema
 def system_instructions():
     instruction = """
-        Você é um assistente pessoal de nome Astra. 
+        Você é um assistente pessoal de nome Altair. 
         Responda de forma, direta e curta. 
         Responda em Português do Brasil.
         Não tente explicar sua resposta.
-        Não repita a pergunda feita.
+        Não repita a pergunta feita.
     """
     return { "role": "system", "content": instruction, }
 
 
 def generate_gpt_response(query):
+    """Generate response from OpenAI GPT model with proper error handling"""
+    if not query or not query.strip():
+        return "Desculpe, não recebi sua pergunta."
+    
     try:
-        messages.append(
-            {"role": "user", "content": query},
-        )
+        messages.append({"role": "user", "content": query.strip()})
+        
         response = client_gpt().chat.completions.create(
-            model=MODEL, messages=messages, max_tokens=700, temperature=0.8
+            model=MODEL, 
+            messages=messages, 
+            max_tokens=700, 
+            temperature=0.8
         )
+        
         reply = response.choices[0].message.content
         messages.append({"role": "assistant", "content": reply})
         return reply
+        
+    except ValueError as ve:
+        logger.error(f"Configuration error: {str(ve)}")
+        return "Erro de configuração. Verifique as credenciais da API."
     except Exception as e:
-        return f"Erro ao gerar resposta: {str(e)}"
+        logger.error(f"Error generating response: {str(e)}")
+        return "Desculpe, houve um problema ao processar sua solicitação."
         
     
 class LaunchRequestHandler(AbstractRequestHandler):
@@ -73,18 +90,31 @@ class LaunchRequestHandler(AbstractRequestHandler):
 
 
 class GptQueryIntentHandler(AbstractRequestHandler):
+    """Handler for GPT query intent"""
+    
     def can_handle(self, handler_input):
         # type: (HandlerInput) -> bool
         return ask_utils.is_intent_name("GptQueryIntent")(handler_input)
 
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
-        query = handler_input.request_envelope.request.intent.slots["query"].value
-        response = generate_gpt_response(query)
+        try:
+            slots = handler_input.request_envelope.request.intent.slots
+            query = slots["query"].value if slots and "query" in slots and slots["query"].value else None
+            
+            if not query:
+                speak_output = "Desculpe, não entendi sua pergunta. Pode repetir?"
+            else:
+                response = generate_gpt_response(query)
+                speak_output = response
+                
+        except Exception as e:
+            logger.error(f"Error in GptQueryIntentHandler: {str(e)}")
+            speak_output = "Desculpe, houve um problema ao processar sua pergunta."
 
         return (
-            handler_input.response_builder.speak(response)
-            .ask("Você pode fazer uma nova pergunta: sair.")
+            handler_input.response_builder.speak(speak_output)
+            .ask("Você pode fazer uma nova pergunta ou dizer sair.")
             .response
         )
 
