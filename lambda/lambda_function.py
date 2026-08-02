@@ -36,7 +36,7 @@ def client_gpt() -> OpenAI:
 # Instruçõers para o sistema
 def system_instructions():
     instruction = """
-        Você é um assistente pessoal de nome Altair. 
+        Você é um assistente pessoal de nome Idiote. 
         Responda de forma, direta e curta. 
         Responda em Português do Brasil.
         Não tente explicar sua resposta.

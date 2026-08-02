@@ -1,6 +1,6 @@
-# Altair - Alexa Skill com Integração OpenAI
+# Idiote - Alexa Skill com Integração OpenAI
 
-Altair é uma skill para Amazon Alexa que integra com a API da OpenAI para fornecer um assistente conversacional inteligente em Português do Brasil. A skill permite fazer perguntas e receber respostas do modelo GPT através de comandos de voz na Alexa.
+Idiote é uma skill para Amazon Alexa que integra com a API da OpenAI para fornecer um assistente conversacional inteligente em Português do Brasil. A skill permite fazer perguntas e receber respostas do modelo GPT através de comandos de voz na Alexa.
 
 ## 🎯 Funcionalidades
 
@@ -28,12 +28,12 @@ Altair é uma skill para Amazon Alexa que integra com a API da OpenAI para forne
 1. Acesse o [Console do Alexa Developer](https://developer.amazon.com/alexa/console/ask/)
 2. Clique em "Create Skill"
 3. Configure:
-   - **Name**: Altair (ou nome de sua preferência)
+   - **Name**: Idiote (ou nome de sua preferência)
    - **Primary locale**: Portuguese (BR)
    - **Experience type**: Other > Custom > Alexa-hosted (Python)
    - **Hosting region**: US East (N. Virginia)
    - **Template**: Import Skill
-   - **URL**: `https://github.com/lucasfrct/altair-skill.git`
+   - **URL**: `https://github.com/lucasfrct/idiota-skill.git`
 
 ### 4. Configuração das Variáveis de Ambiente
 
@@ -57,7 +57,7 @@ OPENAI_API_KEY=sua_api_key_aqui
 
 ### Comandos Básicos
 
-- **Ativar**: "Alexa, abrir Altair"
+- **Ativar**: "Alexa, abrir Idiote"
 - **Fazer pergunta**: Após ativar, simplesmente faça sua pergunta
 - **Exemplos**:
   - "Qual é a capital do Brasil?"
@@ -68,14 +68,14 @@ OPENAI_API_KEY=sua_api_key_aqui
 ### Exemplos de Interação
 
 ```
-Usuário: "Alexa, abrir Altair"
-Altair: "Oi!"
+Usuário: "Alexa, abrir Idiote"
+Idiote: "Oi!"
 
 Usuário: "Qual é a capital da França?"
-Altair: "A capital da França é Paris."
+Idiote: "A capital da França é Paris."
 
 Usuário: "Sair"
-Altair: "Até mais!"
+Idiote: "Até mais!"
 ```
 
 ## 🛠️ Desenvolvimento Local
@@ -90,7 +90,7 @@ pip install -r requirements.txt
 ### Estrutura do Projeto
 
 ```
-altair-skill/
+idiota-skill/
 ├── README.md
 ├── skill.json                 # Configurações da skill
 ├── interactionModels/
@@ -129,7 +129,7 @@ As instruções do sistema podem ser modificadas na função `system_instruction
 ```python
 def system_instructions():
     instruction = """
-        Você é um assistente pessoal de nome Altair. 
+        Você é um assistente pessoal de nome Idiote. 
         Responda de forma, direta e curta. 
         Responda em Português do Brasil.
         [Adicione suas customizações aqui]
@@ -168,7 +168,7 @@ Contribuições são bem-vindas! Por favor:
 
 - Para problemas relacionados à OpenAI: [OpenAI Support](https://help.openai.com/)
 - Para problemas com Alexa Skills: [Amazon Developer Support](https://developer.amazon.com/support/)
-- Para problemas específicos deste projeto: Abra uma [issue](https://github.com/lucasfrct/altair-skill/issues)
+- Para problemas específicos deste projeto: Abra uma [issue](https://github.com/lucasfrct/idiota-skill/issues)
 
 ## 💰 Custos
 

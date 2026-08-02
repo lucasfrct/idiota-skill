@@ -1,6 +1,6 @@
 
 """
-Email functionality for Altair Alexa Skill
+Email functionality for Idiote Alexa Skill
 Provides SMTP email sending capabilities with proper error handling
 """
 
