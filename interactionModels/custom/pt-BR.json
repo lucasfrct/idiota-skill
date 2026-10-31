@@ -34,7 +34,7 @@
           "slots": [
             {
               "name": "query",
-              "type": "AMAZON.SearchQuery"
+              "type": "AMAZON.Person"
             }
           ],
           "name": "GptQueryIntent",

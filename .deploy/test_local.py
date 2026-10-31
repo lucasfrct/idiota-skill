@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""REPL local de teste para a skill Idiote (sem Alexa, sem Lambda).
+"""REPL local de teste para a skill Idiota (sem Alexa, sem Lambda).
 
 Roda dentro do container do docker-compose.yaml, invocando o handler da
 lambda_function.py diretamente com requisicoes Alexa sintetizadas.
@@ -56,7 +56,7 @@ def call(attrs, itype, extra=None):
 
 
 def say(text):
-    print(f"\n  IDIOTE > {text}\n")
+    print(f"\n  IDIOTA > {text}\n")
 
 
 def smoke():
@@ -71,7 +71,10 @@ def smoke():
 
 def repl():
     attrs, opened = {}, False
-    print("REPL local Idiote — comandos: abrir | ajuda | email: <texto> | sair | pergunta livre")
+    print("REPL local Idiota — pergunte à vontade | abrir (reinicia) | ajuda | email: <texto> | sair")
+    s, attrs, _ = call({}, "LaunchRequest")  # abre a sessão sozinho, como "Alexa, abrir idiota"
+    opened = True
+    say(s)
     while True:
         try:
             line = input("VOCÊ   > ").strip()
@@ -101,7 +104,7 @@ def repl():
             say(s)
             continue
         if low.startswith("email:"):
-            s, attrs, _ = call(attrs, "IntentRequest", intent("SendEmailIntent", {"body": line[6:].strip()}))
+            s, attrs, _ = call(attrs, "IntentRequest", intent("SendEmailIntent", {"message": line[6:].strip()}))
             say(s)
             continue
         s, attrs, end = call(attrs, "IntentRequest", intent("GptQueryIntent", {"query": line}))

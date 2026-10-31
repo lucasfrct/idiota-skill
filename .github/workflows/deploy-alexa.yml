@@ -51,9 +51,11 @@ jobs:
 
       - name: Restaurar credenciais ASK CLI
         if: steps.cfg.outputs.available == 'true'
+        env:
+          ASK_CLI_CONFIG: ${{ secrets.ASK_CLI_CONFIG }}
         run: |
           mkdir -p ~/.ask
-          echo "${{ secrets.ASK_CLI_CONFIG }}" > ~/.ask/cli_config
+          printf '%s\n' "$ASK_CLI_CONFIG" > ~/.ask/cli_config
           chmod 600 ~/.ask/cli_config
 
       - name: Instalar ASK CLI
