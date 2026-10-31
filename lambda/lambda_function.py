@@ -93,8 +93,7 @@ def generate_gpt_response(history: list, query):
         response = client.chat.completions.create(
             model=MODEL,
             messages=[system_instructions()] + history[-MAX_HISTORY:],
-            max_tokens=MAX_TOKENS,
-            temperature=0.8,
+            max_completion_tokens=MAX_TOKENS,
         )
 
         reply = sanitize_for_tts(response.choices[0].message.content or "")

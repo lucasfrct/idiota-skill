@@ -1,0 +1,77 @@
+name: Deploy Alexa Skill (hosted)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard-secrets:
+    name: Varredura anti-segredo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bloquear push com credenciais versionadas
+        run: |
+          set -e
+          FOUND=0
+          git grep -nE "sk-proj-[A-Za-z0-9_-]{20,}" -- . && FOUND=1 || true
+          git grep -nE "sk-ant-[A-Za-z0-9_-]{20,}" -- . && FOUND=1 || true
+          git grep -nE "ghp_[A-Za-z0-9]{30,}" -- . && FOUND=1 || true
+          git grep -nE "AKIA[0-9A-Z]{16}" -- . && FOUND=1 || true
+          if [ "$FOUND" = "1" ]; then
+            echo "::error::Segredo detectado em arquivo versionado"
+            exit 1
+          fi
+          echo "Nenhum segredo versionado"
+
+  deploy:
+    name: Publicar na Alexa (hosted)
+    needs: guard-secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checar configuracao do deploy
+        id: cfg
+        env:
+          HAS_CONFIG: ${{ secrets.ASK_CLI_CONFIG }}
+        run: |
+          if [ -z "$HAS_CONFIG" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Secret ASK_CLI_CONFIG ausente - rode 'ask configure' local e 'gh secret set ASK_CLI_CONFIG < ~/.ask/cli_config'. Deploy pulado."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restaurar credenciais ASK CLI
+        if: steps.cfg.outputs.available == 'true'
+        run: |
+          mkdir -p ~/.ask
+          echo "${{ secrets.ASK_CLI_CONFIG }}" > ~/.ask/cli_config
+          chmod 600 ~/.ask/cli_config
+
+      - name: Instalar ASK CLI
+        if: steps.cfg.outputs.available == 'true'
+        run: npm install -g ask-cli
+
+      - name: Publicar skill (codigo + envs + modelo + manifest)
+        if: steps.cfg.outputs.available == 'true'
+        env:
+          ASK_SKILL_ID: ${{ secrets.ASK_SKILL_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          MAX_HISTORY: ${{ secrets.MAX_HISTORY }}
+          MAX_TOKENS: ${{ secrets.MAX_TOKENS }}
+          EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
+          EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_SUBJECT: ${{ secrets.EMAIL_SUBJECT }}
+        run: bash scripts/deploy-alexa.sh
