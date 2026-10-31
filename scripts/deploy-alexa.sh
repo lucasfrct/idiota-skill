@@ -65,16 +65,7 @@ git commit -q -m "deploy: ${GITHUB_SHA::7} (codigo + envs)" --allow-empty
 git push origin "HEAD:$BRANCH"
 echo "Codigo + envs publicados no repo hospedado (CodeBuild da Amazon disparado)"
 
-# --- 4. Modelo de interacao (pt-BR) via SMAPI ---
-ask smapi set-interaction-model \
-    --skill-id "$ASK_SKILL_ID" \
-    --stage development \
-    --locale pt-BR \
-    --interaction-model "${GITHUB_WORKSPACE}/interactionModels/custom/pt-BR.json" \
-    --profile default
-echo "Interaction model atualizado"
-
-# Build do modelo via REST (ASK CLI v2 nao expoe o endpoint de build)
+# --- 4. Modelo de interacao + build + manifest via SMAPI REST direto ---
 source ~/.ask/auth_info
 askRefreshToken=$(tr -d '\n' < ~/.ask/cli_config | tr -d ' ' \
     | sed -n 's/.*"default":{[^{]*"token":{[^{]*"refresh_token":"\([^{]*\)"/\1/p' | sed 's/".*//')
@@ -86,18 +77,35 @@ accessToken=$(curl -f -s \
     "${ask_lwa_api}/auth/O2/token" \
     | tr -d '\n' | sed 's/.*"access_token":"\([^"]*\)".*/\1/')
 [ -n "$accessToken" ] || { echo "ERRO: falha ao obter access token LWA"; exit 1; }
-curl -f -s -X POST \
+
+SKILL_BASE="https://api.amazonalexa.com/v1/skills/${ASK_SKILL_ID}/stages/development"
+
+echo "== interaction model (PUT) =="
+curl -f -s -X PUT \
     -H "Authorization: Bearer ${accessToken}" \
     -H "Content-Type: application/json" \
-    "${ask_smapi_api}/v1/skills/${ASK_SKILL_ID}/stages/development/interactionModels/locales/pt-BR/build" \
-    && echo "Build do modelo disparado (via SMAPI REST)"
+    --data-binary @"${GITHUB_WORKSPACE}/interactionModels/custom/pt-BR.json" \
+    "${SKILL_BASE}/interactionModel/locales/pt-BR" \
+    && echo "Interaction model atualizado (202 aceito, build async)"
 
-# --- 5. Manifest (skill.json) via SMAPI ---
-ask smapi update-skill-manifest \
-    --skill-id "$ASK_SKILL_ID" \
-    --stage development \
-    --manifest "${GITHUB_WORKSPACE}/skill.json" \
-    --profile default
-echo "Manifest atualizado"
+echo "== build do modelo (POST, nao-fatal) =="
+for i in 1 2; do
+    curl -s -X POST \
+        -H "Authorization: Bearer ${accessToken}" \
+        -H "Content-Type: application/json" \
+        "${SKILL_BASE}/interactionModels/locales/pt-BR/build" \
+        | head -c 200
+    echo ""
+    break
+done
+echo "(se o build falhar transitoriamente, rode o workflow de novo ou Build Model no console)"
+
+echo "== manifest (PUT) =="
+curl -f -s -X PUT \
+    -H "Authorization: Bearer ${accessToken}" \
+    -H "Content-Type: application/json" \
+    --data-binary @"${GITHUB_WORKSPACE}/skill.json" \
+    "${SKILL_BASE}/manifest" \
+    && echo "Manifest atualizado"
 
 echo "DEPLOY_CONCLUIDO: codigo + envs + modelo + manifest"
