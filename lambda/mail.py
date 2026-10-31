@@ -21,6 +21,9 @@ import json
 import logging
 import os
 import smtplib
+import time
+import urllib.parse
+import urllib.request
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.mime.multipart import MIMEMultipart
@@ -33,6 +36,9 @@ load_dotenv(Path(__file__).with_name(".env"))  # envs do próprio módulo
 load_dotenv()                                   # fallback: .env do cwd
 
 TIMEOUT = 10  # segundos — evita estourar o limite do Lambda
+OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+_oauth_cache = {}  # {"token": str, "exp": float} — cache do access token por processo
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +52,39 @@ def _err(message):
     return {"ok": False, "error": str(message)}
 
 
+def _xoauth2_token():
+    """Access token OAuth2 via refresh grant (XOAUTH2 — independe de senha de app)."""
+    if _oauth_cache.get("exp", 0) > time.time() + 60:
+        return _oauth_cache["token"]
+    client_id = os.getenv("EMAIL_OAUTH_CLIENT_ID")
+    client_secret = os.getenv("EMAIL_OAUTH_CLIENT_SECRET")
+    refresh = os.getenv("EMAIL_OAUTH_REFRESH_TOKEN")
+    if not (client_id and client_secret and refresh):
+        raise ValueError("OAuth ausente: defina EMAIL_OAUTH_CLIENT_ID, EMAIL_OAUTH_CLIENT_SECRET e EMAIL_OAUTH_REFRESH_TOKEN")
+    body = urllib.parse.urlencode({
+        "client_id": client_id, "client_secret": client_secret,
+        "refresh_token": refresh, "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request(OAUTH_TOKEN_URL, data=body, method="POST")
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+        data = json.loads(response.read())
+    if "access_token" not in data:
+        raise ValueError(f"Refresh OAuth falhou: {data.get('error', data)}")
+    _oauth_cache["token"] = data["access_token"]
+    _oauth_cache["exp"] = time.time() + int(data.get("expires_in", 3600))
+    return _oauth_cache["token"]
+
+
 def _smtp_conf():
     """Config SMTP a partir das envs — fail-fast se ausentes."""
     host = os.getenv("EMAIL_HOST", "smtp.gmail.com")
     port = int(os.getenv("EMAIL_PORT", "587"))
     user = os.getenv("EMAIL_SENDER")
     password = os.getenv("EMAIL_PASSWORD")
-    if not user or not password:
-        raise ValueError("Credenciais SMTP ausentes: defina EMAIL_SENDER e EMAIL_PASSWORD")
+    if not user:
+        raise ValueError("Credenciais SMTP ausentes: defina EMAIL_SENDER")
+    if not password and os.getenv("EMAIL_AUTH", "").lower() != "xoauth2":
+        raise ValueError("Credenciais SMTP ausentes: defina EMAIL_PASSWORD ou EMAIL_AUTH=xoauth2")
     return host, port, user, password
 
 
@@ -63,15 +94,25 @@ def _imap_conf():
     port = int(os.getenv("EMAIL_IMAP_PORT", "993"))
     user = os.getenv("EMAIL_SENDER")
     password = os.getenv("EMAIL_PASSWORD")
-    if not user or not password:
-        raise ValueError("Credenciais IMAP ausentes: defina EMAIL_SENDER e EMAIL_PASSWORD")
+    if not user:
+        raise ValueError("Credenciais IMAP ausentes: defina EMAIL_SENDER")
+    if not password and os.getenv("EMAIL_AUTH", "").lower() != "xoauth2":
+        raise ValueError("Credenciais IMAP ausentes: defina EMAIL_PASSWORD ou EMAIL_AUTH=xoauth2")
     return host, port, user, password
 
 
 def _smtp_auth(server, user, password):
-    """AUTH PLAIN explícito: traz o erro real do servidor (ex.: 535 do Gmail)
-    em vez do 'Connection unexpectedly closed' que o login() dispara quando
-    o servidor encerra a conexão após recusar a credencial."""
+    """Autentica SMTP: XOAUTH2 (EMAIL_AUTH=xoauth2) ou AUTH PLAIN com senha de app."""
+    if os.getenv("EMAIL_AUTH", "").lower() == "xoauth2":
+        token = _xoauth2_token()
+        sasl = base64.b64encode(f"user={user}\x01auth=Bearer {token}\x01\x01".encode()).decode()
+        code, response = server.docmd("AUTH", "XOAUTH2 " + sasl)
+        if code != 235:
+            raise smtplib.SMTPAuthenticationError(code, response)
+        return
+    # AUTH PLAIN explícito: traz o erro real do servidor (ex.: 535 do Gmail)
+    # em vez do 'Connection unexpectedly closed' que o login() dispara quando
+    # o servidor encerra a conexão após recusar a credencial.
     token = base64.b64encode(f"\x00{user}\x00{password}".encode()).decode()
     code, response = server.docmd("AUTH", "PLAIN " + token)
     if code != 235:
@@ -87,6 +128,20 @@ def _connect_smtp():
         server.starttls()
     _smtp_auth(server, user, password)
     return server
+
+
+def _connect_imap():
+    """Conexão IMAP autenticada (XOAUTH2 ou LOGIN), INBOX selecionada readonly."""
+    host, port, user, password = _imap_conf()
+    imap = imaplib.IMAP4_SSL(host, port, timeout=TIMEOUT)
+    if os.getenv("EMAIL_AUTH", "").lower() == "xoauth2":
+        token = _xoauth2_token()
+        sasl = f"user={user}\x01auth=Bearer {token}\x01\x01"
+        imap.authenticate("XOAUTH2", lambda _: sasl.encode())
+    else:
+        imap.login(user, password)
+    imap.select("INBOX", readonly=True)
+    return imap
 
 
 def _decode(value):
@@ -110,10 +165,7 @@ def _body_text(message):
 
 def _fetch_messages(criteria, limit, with_body):
     """Busca mensagens da INBOX (mais recentes primeiro) via IMAP."""
-    host, port, user, password = _imap_conf()
-    with imaplib.IMAP4_SSL(host, port, timeout=TIMEOUT) as imap:
-        imap.login(user, password)
-        imap.select("INBOX", readonly=True)
+    with _connect_imap() as imap:
         status, data = imap.uid("search", None, criteria)
         if status != "OK":
             raise RuntimeError(f"Busca IMAP falhou (status {status})")
@@ -205,10 +257,7 @@ def read_email(uid):
     if not uid or not str(uid).strip().isdigit():
         return _err("UID inválido: informe o número retornado por list/filter")
     try:
-        host, port, user, password = _imap_conf()
-        with imaplib.IMAP4_SSL(host, port, timeout=TIMEOUT) as imap:
-            imap.login(user, password)
-            imap.select("INBOX", readonly=True)
+        with _connect_imap() as imap:
             status, fetched = imap.uid("fetch", str(uid).strip().encode(), "(RFC822)")
             if status != "OK" or not fetched or not fetched[0]:
                 return _err(f"E-mail com UID {uid} não encontrado")

@@ -16,6 +16,7 @@ from ask_sdk_model import Intent, Slot
 from dotenv import load_dotenv
 
 from chat import generate_gpt_response
+import chat
 import cache
 from mail import send_email
 
