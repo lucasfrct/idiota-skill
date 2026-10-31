@@ -1,0 +1,320 @@
+"""Cache / memória local em JSON para a skill Idiota.
+
+Armazenamento: arquivos JSON em CACHE_DIR (default /tmp/idiota-cache — o único
+diretório gravável em uma Lambda AWS). Memória local = cache do container
+quente: sobrevive a invocações enquanto a instância vive; NÃO é armazenamento
+durável (cold start/reciclagem perde; containers concorrentes não compartilham).
+Persistência durável exigiria S3/DynamoDB.
+
+Mecânica:
+- Escrita atômica (arquivo temporário + os.replace) — JSON nunca corrompido.
+- Espelho em memória validado por mtime — leitura sem I/O após a 1ª carga,
+  e edições externas no arquivo são detectadas e recarregadas.
+- Índice por destinatário (dict) para busca O(1) + varredura em memória para
+  texto — reconstruído automaticamente a cada escrita/recarga.
+- Fail-open: nenhuma função lança exceção — cache é auxiliar e nunca derruba
+  a skill; em falha retorna valor seguro (default / False / lista vazia).
+
+Coleções:
+- chats.json  — memória de turnos por usuário {user_id: {"history", "updated"}}
+- emails.json — {"registry" (e-mails disponíveis), "sent" (enviados),
+                 "errors" (falhas), "seq"} com metadados (para, assunto,
+                 mensagem, data, resultado).
+"""
+import json
+import logging
+import os
+import re
+import tempfile
+import threading
+from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+# Configuration (environment-driven)
+CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/idiota-cache")
+MAX_CHAT_TURNS = int(os.getenv("CACHE_MAX_CHAT_TURNS", "40"))
+MAX_USERS = int(os.getenv("CACHE_MAX_USERS", "50"))
+MAX_SENT = int(os.getenv("CACHE_MAX_SENT", "500"))
+MAX_ERRORS = int(os.getenv("CACHE_MAX_ERRORS", "200"))
+MAX_EMAILS = int(os.getenv("CACHE_MAX_EMAILS", "200"))
+BODY_MAX = int(os.getenv("CACHE_BODY_MAX", "2000"))
+
+CHATS = "chats"
+EMAILS = "emails"
+
+_lock = threading.RLock()
+_mirror = {}   # name -> {"mtime_ns": int, "data": ...}
+_gen = {}      # name -> contador de geração (invalida índices)
+_email_index = {"gen": -1, "sent": {}, "errors": {}}
+
+
+def _now() -> str:
+    # microssegundos: ordenação correta entre registros do mesmo segundo
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _path(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", str(name)):
+        raise ValueError(f"Invalid cache name: {name!r}")
+    return os.path.join(CACHE_DIR, f"{name}.json")
+
+
+def _reset_index(name: str):
+    if name == EMAILS:
+        _email_index["gen"] = -1
+
+
+def _load(name: str, default=None):
+    """Load JSON under the in-memory mirror (mtime-checked). Never raises."""
+    try:
+        path = _path(name)
+        mtime = os.stat(path).st_mtime_ns
+    except (ValueError, OSError):
+        return default
+    cached = _mirror.get(name)
+    if cached and cached["mtime_ns"] == mtime:
+        return cached["data"]
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        _mirror[name] = {"mtime_ns": mtime, "data": data}
+        _gen[name] = _gen.get(name, 0) + 1
+        _reset_index(name)
+        return data
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error("cache: failed to load %s: %s", name, e)
+        return default
+
+
+def read_json(name: str, default=None):
+    """Read a JSON collection (mirror-backed)."""
+    with _lock:
+        return _load(name, default)
+
+
+def write_json(name: str, data) -> bool:
+    """Atomically write a JSON collection (tmp file + os.replace)."""
+    try:
+        path = _path(name)
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception:
+            os.unlink(tmp)
+            raise
+        os.replace(tmp, path)
+        mtime = os.stat(path).st_mtime_ns
+        with _lock:
+            _mirror[name] = {"mtime_ns": mtime, "data": data}
+            _gen[name] = _gen.get(name, 0) + 1
+            _reset_index(name)
+        return True
+    except (OSError, ValueError, TypeError) as e:
+        logger.error("cache: failed to write %s: %s", name, e)
+        return False
+
+
+def update_json(name: str, fn, default=None):
+    """Read-modify-write under one lock. `fn(data) -> new_data`;
+    returning None from fn cancels the write."""
+    with _lock:
+        data = _load(name, default)
+        new = fn(data)
+        if new is None:
+            return False
+        return write_json(name, new)
+
+
+# ---------------------------------------------------------------------------
+# Frente 1 — memória de turnos do chat (por usuário; sobrevive a sessões)
+# ---------------------------------------------------------------------------
+
+def load_chat(user_id: str) -> list:
+    """Chat history previously persisted for this user ([] if none)."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return []
+        data = read_json(CHATS, default={}) or {}
+        return list(data.get(user_id, {}).get("history", []))
+    except Exception as e:
+        logger.error("cache: load_chat failed: %s", e)
+        return []
+
+
+def save_chat(user_id: str, history: list) -> bool:
+    """Persist chat history for a user (bounded; evicts oldest users)."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return False
+        turns = list(history or [])[-max(1, MAX_CHAT_TURNS):]
+
+        def fn(data):
+            data = dict(data or {})
+            now = _now()
+            data[user_id] = {"history": turns, "updated": now}
+            if len(data) > max(1, MAX_USERS):
+                oldest = sorted(
+                    (k for k in data if k != user_id),
+                    key=lambda k: data[k].get("updated", ""),
+                )
+                for k in oldest[: len(data) - max(1, MAX_USERS)]:
+                    data.pop(k, None)
+            return data
+
+        return update_json(CHATS, fn, default={})
+    except Exception as e:
+        logger.error("cache: save_chat failed: %s", e)
+        return False
+
+
+def clear_chat(user_id: str) -> bool:
+    """Drop a user's persisted chat memory."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return False
+
+        def fn(data):
+            data = dict(data or {})
+            if user_id not in data:
+                return None
+            data.pop(user_id, None)
+            return data
+
+        return update_json(CHATS, fn, default={})
+    except Exception as e:
+        logger.error("cache: clear_chat failed: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Frente 2 — e-mails: disponíveis (registry), enviados e com erro
+# ---------------------------------------------------------------------------
+
+def _touch_registry(data, email: str, now: str):
+    """Registry of available emails — every new email goes to the list."""
+    registry = data.setdefault("registry", [])
+    entry = next((r for r in registry if r["email"].lower() == email.lower()), None)
+    if entry:
+        entry["last_used"] = now
+        entry["count"] = int(entry.get("count", 0)) + 1
+    else:
+        registry.append({"email": email, "first_used": now, "last_used": now, "count": 1})
+    registry.sort(key=lambda r: r.get("last_used", ""), reverse=True)
+    del registry[max(1, MAX_EMAILS):]
+
+
+def _trim(data):
+    data["sent"] = data.get("sent", [])[-max(1, MAX_SENT):]
+    data["errors"] = data.get("errors", [])[-max(1, MAX_ERRORS):]
+
+
+def record_email(to_email: str, subject: str = "", body: str = "",
+                 ok: bool = True, info: str = "") -> bool:
+    """Record an email attempt: metadata + status, and register the address."""
+    try:
+        to_email = str(to_email or "").strip().lower()
+        if not to_email or "@" not in to_email:
+            return False
+        now = _now()
+
+        def fn(data):
+            data = dict(data or {})
+            seq = int(data.get("seq", 0)) + 1
+            data["seq"] = seq
+            record = {
+                "id": seq,
+                "to": to_email,
+                "subject": str(subject or ""),
+                "body": str(body or "")[:max(0, BODY_MAX)],
+                "at": now,
+            }
+            if ok:
+                record["info"] = str(info or "")
+                data.setdefault("sent", []).append(record)
+            else:
+                record["error"] = str(info or "")
+                data.setdefault("errors", []).append(record)
+            _touch_registry(data, to_email, now)
+            _trim(data)
+            return data
+
+        return update_json(EMAILS, fn, default={})
+    except Exception as e:
+        logger.error("cache: record_email failed: %s", e)
+        return False
+
+
+def _index(data):
+    """Recipient -> entries index (O(1) lookups); rebuilt per generation."""
+    if _email_index["gen"] == _gen.get(EMAILS, 0):
+        return _email_index
+    sent, errors = {}, {}
+    for entry in data.get("sent", []):
+        sent.setdefault(entry["to"].lower(), []).append(entry)
+    for entry in data.get("errors", []):
+        errors.setdefault(entry["to"].lower(), []).append(entry)
+    _email_index.update({"gen": _gen.get(EMAILS, 0), "sent": sent, "errors": errors})
+    return _email_index
+
+
+def _search(data, pool: str, recipient=None, contains=None,
+            since=None, limit=20) -> list:
+    limit = max(0, int(limit or 0))
+    if limit == 0:
+        return []
+    entries = data.get(pool, [])
+    idx = _index(data)
+    if recipient:
+        entries = list(idx[pool].get(str(recipient).strip().lower(), []))
+    entries = list(reversed(entries))  # newest first
+    if since:
+        entries = [e for e in entries if e.get("at", "") >= since]
+    if contains:
+        needle = str(contains).strip().lower()
+        entries = [e for e in entries
+                   if needle in e.get("subject", "").lower()
+                   or needle in e.get("body", "").lower()]
+    return [dict(e) for e in entries[:limit]]
+
+
+def list_sent_emails(recipient=None, contains=None, since=None, limit=20) -> list:
+    """Sent emails (newest first), filterable — indexed O(1) by recipient."""
+    try:
+        with _lock:
+            data = read_json(EMAILS, default={}) or {}
+            return _search(data, "sent", recipient, contains, since, limit)
+    except Exception as e:
+        logger.error("cache: list_sent_emails failed: %s", e)
+        return []
+
+
+def list_error_emails(recipient=None, contains=None, since=None, limit=20) -> list:
+    """Failed emails (newest first), filterable — indexed O(1) by recipient."""
+    try:
+        with _lock:
+            data = read_json(EMAILS, default={}) or {}
+            return _search(data, "errors", recipient, contains, since, limit)
+    except Exception as e:
+        logger.error("cache: list_error_emails failed: %s", e)
+        return []
+
+
+def list_available_emails(limit=50) -> list:
+    """Registered email addresses, most recently used first."""
+    try:
+        limit = max(0, int(limit or 0))
+        if limit == 0:
+            return []
+        with _lock:
+            data = read_json(EMAILS, default={}) or {}
+            registry = data.get("registry", [])
+            return [r["email"] for r in registry[:limit]]
+    except Exception as e:
+        logger.error("cache: list_available_emails failed: %s", e)
+        return []

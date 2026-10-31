@@ -16,6 +16,7 @@ from ask_sdk_model import Intent, Slot
 from dotenv import load_dotenv
 
 from chat import generate_gpt_response
+import cache
 from mail import send_email
 
 # Load environment variables
@@ -30,6 +31,14 @@ EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT") or EMAIL_SENDER
 EMAIL_SUBJECT = os.getenv("EMAIL_SUBJECT", "Mensagem do Idiota")
 
 ASK_REPROMPT = "Você pode fazer uma pergunta, pedir para enviar um e-mail, ou dizer sair."
+
+
+def user_id(handler_input) -> str:
+    """Stable per-user id — the key for local chat memory (sessions change)."""
+    try:
+        return handler_input.request_envelope.session.user.user_id or ""
+    except AttributeError:
+        return ""
 
 
 def get_history(handler_input) -> list:
@@ -124,7 +133,22 @@ def send_pending_email(handler_input):
 
     result = send_email(EMAIL_SENDER, EMAIL_RECIPIENT, flow["subject"], flow["body"])
     logger.info(f"Email attempt result: {result}")
-    return result["data"] if result.get("ok") else result.get("error", "Falha ao enviar o e-mail")
+
+    # Frente 2 do cache: metadados do envio + lista de e-mails disponíveis
+    ok = bool(result.get("ok")) if isinstance(result, dict) else False
+    info = (result.get("data") or result.get("error") or "") if isinstance(result, dict) else str(result)
+    cache.record_email(
+        to_email=EMAIL_RECIPIENT,
+        subject=flow.get("subject", ""),
+        body=flow.get("body", ""),
+        ok=ok,
+        info=str(info),
+    )
+
+    # Fala derivada do envelope (send_email nunca lança; nunca falar dict)
+    if ok:
+        return str(info) or f"E-mail enviado com sucesso para {EMAIL_RECIPIENT}."
+    return str(info) or "Não consegui enviar o e-mail."
 
 
 class LaunchRequestHandler(AbstractRequestHandler):
@@ -135,7 +159,11 @@ class LaunchRequestHandler(AbstractRequestHandler):
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
         clear_email_flow(handler_input)
-        handler_input.attributes_manager.session_attributes["chat_history"] = []
+        # Memória de turnos: restaura a conversa anterior do usuário (cache
+        # local); se não houver, começa vazia — degradação suave.
+        handler_input.attributes_manager.session_attributes["chat_history"] = (
+            chat.load_history(user_id(handler_input))
+        )
         speak_output = (
             "Olá! Sou o Idiota. Pode fazer sua pergunta, "
             "ou pedir para eu enviar um e-mail."
@@ -183,6 +211,8 @@ class GptQueryIntentHandler(AbstractRequestHandler):
 
             history = get_history(handler_input)
             speak_output = generate_gpt_response(history, query)
+            # Persiste a memória de turnos do usuário no cache local
+            chat.save_history(user_id(handler_input), history)
 
         except Exception as e:
             logger.error(f"Error in GptQueryIntentHandler: {e}")

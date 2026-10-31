@@ -10,6 +10,8 @@ import logging
 from openai import OpenAI
 from dotenv import load_dotenv
 
+import cache
+
 # Load environment variables (idempotent; never overrides real env vars)
 load_dotenv()
 
@@ -52,6 +54,28 @@ def sanitize_for_tts(text: str) -> str:
     text = re.sub(r"^[ \t]+|[ \t]+$", "", text, flags=re.M)
     text = re.sub(r"\n\s*\n+", "\n", text)
     return text.strip()
+
+
+def load_history(user_id: str) -> list:
+    """Restore previous chat memory for a user from the local cache.
+
+    Memória de turnos além da sessão Alexa: o usuário retoma a conversa
+    de onde parou. Falha do cache degrada para [] (só memória de sessão).
+    """
+    try:
+        return list(cache.load_chat(user_id))
+    except Exception as e:
+        logger.error(f"Chat memory restore failed: {e}")
+        return []
+
+
+def save_history(user_id: str, history: list) -> bool:
+    """Persist the chat history to the local cache (bounded by MAX_HISTORY)."""
+    try:
+        return cache.save_chat(user_id, list(history or [])[-MAX_HISTORY:])
+    except Exception as e:
+        logger.error(f"Chat memory persist failed: {e}")
+        return False
 
 
 def generate_gpt_response(history: list, query) -> str:
