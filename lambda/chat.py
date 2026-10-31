@@ -70,11 +70,25 @@ def load_history(user_id: str) -> list:
 
 
 def save_history(user_id: str, history: list) -> bool:
-    """Persist the chat history to the local cache (bounded by MAX_HISTORY)."""
+    """Persist the chat history to the local cache (bounded by MAX_HISTORY).
+
+    None é parâmetro inválido (fail-fast -> False); [] é estado válido.
+    """
     try:
-        return cache.save_chat(user_id, list(history or [])[-MAX_HISTORY:])
+        if history is None:
+            return False
+        return cache.save_chat(user_id, list(history)[-MAX_HISTORY:])
     except Exception as e:
         logger.error(f"Chat memory persist failed: {e}")
+        return False
+
+
+def clear_history(user_id: str) -> bool:
+    """Erase a user's persisted chat memory (cache.clear_chat)."""
+    try:
+        return cache.clear_chat(user_id)
+    except Exception as e:
+        logger.error(f"Chat memory clear failed: {e}")
         return False
 
 

@@ -67,8 +67,14 @@ echo "Codigo + envs publicados no repo hospedado (CodeBuild da Amazon disparado)
 
 # --- 4. Modelo de interacao + build + manifest via SMAPI REST direto ---
 source ~/.ask/auth_info
-askRefreshToken=$(tr -d '\n' < ~/.ask/cli_config | tr -d ' ' \
-    | sed -n 's/.*"default":{[^{]*"token":{[^{]*"refresh_token":"\([^{]*\)"/\1/p' | sed 's/".*//')
+askRefreshToken=$(python3 -c "
+import json
+d = json.load(open('$HOME/.ask/cli_config'))
+p = d.get('profiles', d)
+prof = p.get('default', {}) if isinstance(p, dict) else {}
+t = prof.get('token', prof) if isinstance(prof, dict) else {}
+print(t.get('refresh_token', ''))
+" 2>/dev/null || true)
 accessToken=$(curl -f -s \
     -d grant_type=refresh_token \
     -d client_id="${ASK_LWA_CLIENT_ID:?ASK_LWA_CLIENT_ID ausente}" \
