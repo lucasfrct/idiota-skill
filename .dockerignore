@@ -1,0 +1,7 @@
+.git
+.venv
+lambda/.venv
+**/__pycache__
+.ask-config
+.env
+lambda/.env

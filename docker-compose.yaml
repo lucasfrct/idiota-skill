@@ -1,0 +1,20 @@
+services:
+  ask:
+    build:
+      context: .
+      dockerfile: .deploy/Dockerfile
+    image: idiota-ask-cli
+    container_name: idiota-ask
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - ask-config:/root/.ask
+    ports:
+      - "9090:9090"
+    env_file:
+      - lambda/.env
+
+volumes:
+  ask-config:

@@ -19,6 +19,18 @@
           "samples": []
         },
         {
+          "name": "AMAZON.FallbackIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.YesIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.NoIntent",
+          "samples": []
+        },
+        {
           "slots": [
             {
               "name": "query",
@@ -35,14 +47,73 @@
             "qual é {query}",
             "como {query}",
             "o que é {query}",
+            "quem é {query}",
+            "quando {query}",
+            "onde {query}",
+            "por que {query}",
             "me fale sobre {query}",
+            "conte sobre {query}",
             "você sabe {query}",
             "pode me explicar {query}"
+          ]
+        },
+        {
+          "slots": [
+            {
+              "name": "message",
+              "type": "AMAZON.SearchQuery",
+              "samples": [
+                "dizendo {message}",
+                "com a mensagem {message}",
+                "com o texto {message}"
+              ]
+            }
+          ],
+          "name": "SendEmailIntent",
+          "samples": [
+            "enviar e-mail {message}",
+            "mandar e-mail {message}",
+            "manda um e-mail {message}",
+            "envie um e-mail {message}",
+            "enviar e-mail dizendo {message}",
+            "enviar e-mail"
           ]
         }
       ],
       "types": [],
-      "invocationName": "idiote"
-    }
+      "invocationName": "idiota"
+    },
+    "dialog": {
+      "delegationStrategy": "SKILL_RESPONSE",
+      "intents": [
+        {
+          "name": "SendEmailIntent",
+          "confirmationRequired": false,
+          "prompts": {},
+          "slots": [
+            {
+              "name": "message",
+              "type": "AMAZON.SearchQuery",
+              "confirmationRequired": false,
+              "elicitationRequired": true,
+              "prompts": {
+                "elicitation": "Elicit.SendEmail.Message"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "prompts": [
+      {
+        "id": "Elicit.SendEmail.Message",
+        "variations": [
+          {
+            "type": "PlainText",
+            "value": "O que você quer enviar no e-mail?"
+          }
+        ]
+      }
+    ]
   }
 }

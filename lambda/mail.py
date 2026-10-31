@@ -1,6 +1,6 @@
 
 """
-Email functionality for Idiote Alexa Skill
+Email functionality for Idiota Alexa Skill
 Provides SMTP email sending capabilities with proper error handling
 """
 
@@ -23,8 +23,8 @@ def server_smtp() -> smtplib.SMTP:
     smtp_port = int(os.getenv('EMAIL_PORT', '587'))
 
     try:
-        # Connect to the SMTP server
-        server = smtplib.SMTP(smtp_server, smtp_port)
+        # Connect to the SMTP server (timeout avoids hanging the Lambda)
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
         server.starttls()
         return server
     except Exception as e:
