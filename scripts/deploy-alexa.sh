@@ -66,7 +66,7 @@ git push origin "HEAD:$BRANCH"
 echo "Codigo + envs publicados no repo hospedado (CodeBuild da Amazon disparado)"
 
 # --- 4. Modelo de interacao (pt-BR) via SMAPI ---
-ask smapi update-interaction-model \
+ask smapi set-interaction-model \
     --skill-id "$ASK_SKILL_ID" \
     --stage development \
     --locale pt-BR \
@@ -74,15 +74,26 @@ ask smapi update-interaction-model \
     --profile default
 echo "Interaction model atualizado"
 
-ask smapi build-model \
-    --skill-id "$ASK_SKILL_ID" \
-    --stage development \
-    --locale pt-BR \
-    --profile default
-echo "Build do modelo disparado (acompanhe o status no console)"
+# Build do modelo via REST (ASK CLI v2 nao expoe o endpoint de build)
+source ~/.ask/auth_info
+askRefreshToken=$(tr -d '\n' < ~/.ask/cli_config | tr -d ' ' \
+    | sed -n 's/.*"default":{[^{]*"token":{[^{]*"refresh_token":"\([^{]*\)"/\1/p' | sed 's/".*//')
+accessToken=$(curl -f -s \
+    -d grant_type=refresh_token \
+    -d client_id="${ASK_LWA_CLIENT_ID:?ASK_LWA_CLIENT_ID ausente}" \
+    -d client_secret="${ASK_LWA_CLIENT_CONFIRMATION:?ASK_LWA_CLIENT_CONFIRMATION ausente}" \
+    -d refresh_token="$askRefreshToken" \
+    "${ask_lwa_api}/auth/O2/token" \
+    | tr -d '\n' | sed 's/.*"access_token":"\([^"]*\)".*/\1/')
+[ -n "$accessToken" ] || { echo "ERRO: falha ao obter access token LWA"; exit 1; }
+curl -f -s -X POST \
+    -H "Authorization: Bearer ${accessToken}" \
+    -H "Content-Type: application/json" \
+    "${ask_smapi_api}/v1/skills/${ASK_SKILL_ID}/stages/development/interactionModels/locales/pt-BR/build" \
+    && echo "Build do modelo disparado (via SMAPI REST)"
 
 # --- 5. Manifest (skill.json) via SMAPI ---
-ask smapi update-manifest \
+ask smapi update-skill-manifest \
     --skill-id "$ASK_SKILL_ID" \
     --stage development \
     --file "${GITHUB_WORKSPACE}/skill.json" \
