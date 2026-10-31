@@ -70,7 +70,7 @@ ask smapi set-interaction-model \
     --skill-id "$ASK_SKILL_ID" \
     --stage development \
     --locale pt-BR \
-    --file "${GITHUB_WORKSPACE}/interactionModels/custom/pt-BR.json" \
+    --interaction-model "${GITHUB_WORKSPACE}/interactionModels/custom/pt-BR.json" \
     --profile default
 echo "Interaction model atualizado"
 
@@ -96,7 +96,7 @@ curl -f -s -X POST \
 ask smapi update-skill-manifest \
     --skill-id "$ASK_SKILL_ID" \
     --stage development \
-    --file "${GITHUB_WORKSPACE}/skill.json" \
+    --manifest "${GITHUB_WORKSPACE}/skill.json" \
     --profile default
 echo "Manifest atualizado"
 

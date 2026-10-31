@@ -15,6 +15,7 @@ CLI (standalone usage):
     python mail.py read <uid>
 """
 import argparse
+import base64
 import imaplib
 import json
 import logging
@@ -67,6 +68,16 @@ def _imap_conf():
     return host, port, user, password
 
 
+def _smtp_auth(server, user, password):
+    """AUTH PLAIN explícito: traz o erro real do servidor (ex.: 535 do Gmail)
+    em vez do 'Connection unexpectedly closed' que o login() dispara quando
+    o servidor encerra a conexão após recusar a credencial."""
+    token = base64.b64encode(f"\x00{user}\x00{password}".encode()).decode()
+    code, response = server.docmd("AUTH", "PLAIN " + token)
+    if code != 235:
+        raise smtplib.SMTPAuthenticationError(code, response)
+
+
 def _connect_smtp():
     host, port, user, password = _smtp_conf()
     if port == 465:
@@ -74,7 +85,7 @@ def _connect_smtp():
     else:
         server = smtplib.SMTP(host, port, timeout=TIMEOUT)
         server.starttls()
-    server.login(user, password)
+    _smtp_auth(server, user, password)
     return server
 
 
