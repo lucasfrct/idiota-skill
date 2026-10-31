@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Deploy da skill Idiota para a Alexa-hosted a partir do CI.
-# Fluxo: conecta o remote hospedado (Amazon) -> publica lambda/.env a partir
-# de variaveis de ambiente (Secrets) -> push do codigo -> modelo + manifest via SMAPI.
-# O segredo NUNCA vai para o repo publico: lambda/.env e gitignored; o force-add
-# acontece apenas no checkout efemero do CI, apontando para o remote hospedado.
+# Fluxo: clona o repo hospedado (CodeCommit, auth via helper ASK CLI) ->
+# sincroniza o codigo da skill -> escreve lambda/.env a partir dos Secrets ->
+# commit + push (dispara o CodeBuild da Amazon) -> modelo e manifest via SMAPI.
+# O segredo NUNCA vai para o repo publico: vive so nos Secrets e no repo
+# privado hospedado da Amazon.
 set -euo pipefail
 
 : "${ASK_SKILL_ID:?ASK_SKILL_ID nao definido}"
+: "${GITHUB_WORKSPACE:?Fora do CI}"
 command -v ask >/dev/null 2>&1 || { echo "ERRO: ASK CLI ausente"; exit 1; }
-command -v git >/dev/null 2>&1 || { echo "ERRO: git ausente"; exit 1; }
 
 # --- 1. Escrever lambda/.env exclusivamente a partir do ambiente (Secrets) ---
 : "${OPENAI_API_KEY:?OPENAI_API_KEY nao definido nos Secrets}"
@@ -27,40 +28,49 @@ EOF
 chmod 600 lambda/.env
 echo "lambda/.env gerado a partir dos Secrets (nunca versionado no repo publico)"
 
-# --- 2. Remote hospedado (CodeCommit) + helper de credenciais do ASK CLI ---
+# --- 2. Auth do repo hospedado (CodeCommit) via helper do ASK CLI ---
 SKILL_UUID="${ASK_SKILL_ID#amzn1.ask.skill.}"
 CODECOMMIT_URL="https://git-codecommit.us-east-1.amazonaws.com/v1/repos/${SKILL_UUID}"
 
 mkdir -p ~/.ask/scripts
-install -m 755 scripts/git-credential-helper ~/.ask/scripts/git-credential-helper
-install -m 644 scripts/ask-auth-info ~/.ask/auth_info
+install -m 755 "${GITHUB_WORKSPACE}/scripts/git-credential-helper" ~/.ask/scripts/git-credential-helper
+install -m 644 "${GITHUB_WORKSPACE}/scripts/ask-auth-info" ~/.ask/auth_info
+git config --global "credential.${CODECOMMIT_URL}.helper" "!$HOME/.ask/scripts/git-credential-helper default $ASK_SKILL_ID"
+git config --global "credential.${CODECOMMIT_URL}.useHttpPath" true
+echo "Helper de credenciais instalado (credenciais de curta duracao via SMAPI)"
 
-git remote remove hosted 2>/dev/null || true
-git remote add hosted "$CODECOMMIT_URL"
-git config "credential.${CODECOMMIT_URL}.helper" "!$HOME/.ask/scripts/git-credential-helper default $ASK_SKILL_ID"
-git config "credential.${CODECOMMIT_URL}.useHttpPath" true
-REMOTE=hosted
-echo "Remote hospedado: $REMOTE -> ${CODECOMMIT_URL%/repos/*}/repos/***"
+# --- 3. Clonar o repo hospedado e sincronizar o codigo da skill ---
+rm -rf /tmp/hosted-deploy
+git clone --depth 1 "$CODECOMMIT_URL" /tmp/hosted-deploy 2>/dev/null
+cd /tmp/hosted-deploy
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo "Repo hospedado clonado - branch de deploy: $BRANCH"
 
-# --- 3. Detectar branch padrao do repo hospedado (tambem valida o auth) ---
-HOSTED_BRANCH=$(git ls-remote --symref "$REMOTE" HEAD | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
-: "${HOSTED_BRANCH:=master}"
-echo "Branch padrao do repo hospedado: $HOSTED_BRANCH"
+rsync -a --delete \
+    --exclude '__pycache__/' --exclude '.venv/' --exclude '.env' \
+    "${GITHUB_WORKSPACE}/lambda/" lambda/
+rsync -a --delete --exclude '__pycache__/' \
+    "${GITHUB_WORKSPACE}/interactionModels/" skill-package/interactionModels/ 2>/dev/null || true
+cp "${GITHUB_WORKSPACE}/skill.json" skill-package/skill.json 2>/dev/null || \
+    cp "${GITHUB_WORKSPACE}/skill.json" skill.json
 
-# --- 4. Publicar codigo + .env no remote hospedado ---
+# .env do CI entra no pacote da Lambda (repo privado da Amazon)
+cp "${GITHUB_WORKSPACE}/lambda/.env" lambda/.env
+chmod 600 lambda/.env
+
 git config user.email "ci@users.noreply.github.com"
 git config user.name "alexa-deploy-ci"
-git add -f lambda/.env
-git commit -m "ci: sync envs para deploy hospedado" --allow-empty -q
-git push "$REMOTE" "HEAD:$HOSTED_BRANCH"
-echo "Codigo publicado no repo hospedado da Alexa"
+git add -A
+git commit -q -m "deploy: ${GITHUB_SHA::7} (codigo + envs)" --allow-empty
+git push origin "HEAD:$BRANCH"
+echo "Codigo + envs publicados no repo hospedado (CodeBuild da Amazon disparado)"
 
-# --- 5. Modelo de interacao (pt-BR) via SMAPI ---
+# --- 4. Modelo de interacao (pt-BR) via SMAPI ---
 ask smapi update-interaction-model \
     --skill-id "$ASK_SKILL_ID" \
     --stage development \
     --locale pt-BR \
-    --file "interactionModels/custom/pt-BR.json" \
+    --file "${GITHUB_WORKSPACE}/interactionModels/custom/pt-BR.json" \
     --profile default
 echo "Interaction model atualizado"
 
@@ -71,11 +81,11 @@ ask smapi build-model \
     --profile default
 echo "Build do modelo disparado (acompanhe o status no console)"
 
-# --- 6. Manifest (skill.json) via SMAPI ---
+# --- 5. Manifest (skill.json) via SMAPI ---
 ask smapi update-manifest \
     --skill-id "$ASK_SKILL_ID" \
     --stage development \
-    --file "skill.json" \
+    --file "${GITHUB_WORKSPACE}/skill.json" \
     --profile default
 echo "Manifest atualizado"
 
