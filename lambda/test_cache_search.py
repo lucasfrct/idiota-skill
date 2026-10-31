@@ -350,13 +350,16 @@ def s4_since_boundary():
     cache.write_json(cache.EMAILS, ds)
     global DATA
     DATA = ds  # referência passa a descrever o store atual
-    got = cache.list_sent_emails(since="2026-01-01T00:00:30", limit=10_000)
+    since = ds["sent"][250]["at"]  # corte no ponto médio real dos timestamps
+    got = cache.list_sent_emails(since=since, limit=10_000)
     assert got, "dataset deve ter registros após o corte"
-    assert all(e["at"] >= "2026-01-01T00:00:30" for e in got)
-    ref = reference("sent", since="2026-01-01T00:00:30", limit=10_000)
+    assert all(e["at"] >= since for e in got)
+    ref = reference("sent", since=since, limit=10_000)
     assert got == ref
-    assert cache.list_error_emails(since="2026-01-01T00:00:30", limit=10_000) == \
-        reference("errors", since="2026-01-01T00:00:30", limit=10_000)
+    assert cache.list_error_emails(since=since, limit=10_000) == \
+        reference("errors", since=since, limit=10_000)
+    # inclusivo: registro exatamente no corte entra
+    assert any(e["at"] == since for e in got)
 check("r17 filtro since inclusivo e idêntico à referência", s4_since_boundary)
 
 def s4_degenerate_limits():

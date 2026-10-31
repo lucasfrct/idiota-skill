@@ -22,6 +22,7 @@ import logging
 import os
 import smtplib
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from email import message_from_bytes
@@ -66,8 +67,14 @@ def _xoauth2_token():
         "refresh_token": refresh, "grant_type": "refresh_token",
     }).encode()
     req = urllib.request.Request(OAUTH_TOKEN_URL, data=body, method="POST")
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
-        data = json.loads(response.read())
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+            data = json.loads(response.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:200]
+        raise ValueError(f"Refresh OAuth falhou (HTTP {e.code}): {detail}") from e
+    except urllib.error.URLError as e:
+        raise ValueError(f"Refresh OAuth falhou: {e.reason}") from e
     if "access_token" not in data:
         raise ValueError(f"Refresh OAuth falhou: {data.get('error', data)}")
     _oauth_cache["token"] = data["access_token"]
