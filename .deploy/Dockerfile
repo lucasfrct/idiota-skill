@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        nodejs npm \
+        git curl nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g ask-cli

@@ -27,20 +27,22 @@ EOF
 chmod 600 lambda/.env
 echo "lambda/.env gerado a partir dos Secrets (nunca versionado no repo publico)"
 
-# --- 2. Conectar o remote hospedado da skill (idempotente; nome varia) ---
-if ! git remote | grep -q .; then
-    echo "ERRO: nenhum remote git no checkout"; exit 1
-fi
-if ! git remote -v | grep -q "amazonaws.com"; then
-    ask init --hosted-skill-id "$ASK_SKILL_ID" --profile default < /dev/null
-fi
-REMOTE=$(for r in $(git remote); do
-    git remote get-url "$r" 2>/dev/null | grep -q "amazonaws.com" && { echo "$r"; break; }
-done)
-: "${REMOTE:=$(git remote | head -1)}"
-echo "Remote hospedado: $REMOTE ($(git remote get-url "$REMOTE" | sed 's/@.*/@***/'))"
+# --- 2. Remote hospedado (CodeCommit) + helper de credenciais do ASK CLI ---
+SKILL_UUID="${ASK_SKILL_ID#amzn1.ask.skill.}"
+CODECOMMIT_URL="https://git-codecommit.us-east-1.amazonaws.com/v1/repos/${SKILL_UUID}"
 
-# --- 3. Detectar branch padrao do repo hospedado ---
+mkdir -p ~/.ask/scripts
+install -m 755 scripts/git-credential-helper ~/.ask/scripts/git-credential-helper
+install -m 644 scripts/ask-auth-info ~/.ask/auth_info
+
+git remote remove hosted 2>/dev/null || true
+git remote add hosted "$CODECOMMIT_URL"
+git config "credential.${CODECOMMIT_URL}.helper" "!$HOME/.ask/scripts/git-credential-helper default $ASK_SKILL_ID"
+git config "credential.${CODECOMMIT_URL}.useHttpPath" true
+REMOTE=hosted
+echo "Remote hospedado: $REMOTE -> ${CODECOMMIT_URL%/repos/*}/repos/***"
+
+# --- 3. Detectar branch padrao do repo hospedado (tambem valida o auth) ---
 HOSTED_BRANCH=$(git ls-remote --symref "$REMOTE" HEAD | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
 : "${HOSTED_BRANCH:=master}"
 echo "Branch padrao do repo hospedado: $HOSTED_BRANCH"

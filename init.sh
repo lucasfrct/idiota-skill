@@ -1,0 +1,1 @@
+docker exec -it -w /workspace/lambda idiota-ask python3 /workspace/.deploy/test_local.py

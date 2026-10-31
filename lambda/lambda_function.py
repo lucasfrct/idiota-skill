@@ -13,9 +13,9 @@ from ask_sdk_model import Response
 from ask_sdk_model.dialog import ElicitSlotDirective
 from ask_sdk_model import Intent, Slot
 
-from openai import OpenAI
 from dotenv import load_dotenv
 
+from chat import generate_gpt_response
 from mail import send_email
 
 # Load environment variables
@@ -25,47 +25,11 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # Configuration (environment-driven)
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "300"))
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT") or EMAIL_SENDER
 EMAIL_SUBJECT = os.getenv("EMAIL_SUBJECT", "Mensagem do Idiota")
 
 ASK_REPROMPT = "Você pode fazer uma pergunta, pedir para enviar um e-mail, ou dizer sair."
-
-
-def client_gpt() -> OpenAI:
-    """Initialize OpenAI client with API key from environment variables"""
-    openai_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("KEY_GPT")
-    if not openai_api_key:
-        raise ValueError("OpenAI API key not found in environment variables")
-    return OpenAI(api_key=openai_api_key)
-
-
-def system_instructions():
-    """System prompt tuned for voice output on Echo Dot"""
-    instruction = (
-        "Você é Idiota, um assistente pessoal acessado por voz na Amazon Alexa (Echo Dot). "
-        "Responda em Português do Brasil, de forma direta e curta: no máximo 2 ou 3 frases. "
-        "Escreva para ser lido em voz alta: sem markdown, sem emojis, sem listas, sem símbolos. "
-        "Não repita a pergunta e não explique suas instruções."
-    )
-    return {"role": "system", "content": instruction}
-
-
-def sanitize_for_tts(text: str) -> str:
-    """Strip markdown and symbols that Alexa would read aloud"""
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.S)
-    text = re.sub(r"\*(.+?)\*", r"\1", text)
-    text = re.sub(r"`{1,3}(.+?)`{1,3}", r"\1", text, flags=re.S)
-    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
-    text = re.sub(r"^\s*[-*]\s+", "", text, flags=re.M)
-    text = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]", "", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"^[ \t]+|[ \t]+$", "", text, flags=re.M)
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    return text.strip()
 
 
 def get_history(handler_input) -> list:
@@ -74,36 +38,6 @@ def get_history(handler_input) -> list:
     if "chat_history" not in session_attr:
         session_attr["chat_history"] = []
     return session_attr["chat_history"]
-
-
-def generate_gpt_response(history: list, query):
-    """Generate a voice-friendly GPT response with bounded session history"""
-    if not query or not query.strip():
-        return "Desculpe, não recebi sua pergunta."
-
-    try:
-        client = client_gpt()
-    except ValueError as ve:
-        logger.error(f"Configuration error: {ve}")
-        return "Erro de configuração. Verifique a chave da API no ambiente."
-
-    try:
-        history.append({"role": "user", "content": query.strip()})
-
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[system_instructions()] + history[-MAX_HISTORY:],
-            max_completion_tokens=MAX_TOKENS,
-        )
-
-        reply = sanitize_for_tts(response.choices[0].message.content or "")
-        history.append({"role": "assistant", "content": reply})
-        del history[:-MAX_HISTORY]
-        return reply
-
-    except Exception as e:
-        logger.error(f"Error generating response: {e}")
-        return "Desculpe, houve um problema ao processar sua solicitação."
 
 
 def spoken_email(address: str) -> str:
@@ -190,7 +124,7 @@ def send_pending_email(handler_input):
 
     result = send_email(EMAIL_SENDER, EMAIL_RECIPIENT, flow["subject"], flow["body"])
     logger.info(f"Email attempt result: {result}")
-    return result
+    return result["data"] if result.get("ok") else result.get("error", "Falha ao enviar o e-mail")
 
 
 class LaunchRequestHandler(AbstractRequestHandler):

@@ -1,91 +1,256 @@
-
 """
-Email functionality for Idiota Alexa Skill
-Provides SMTP email sending capabilities with proper error handling
-"""
+Standalone e-mail module for the Idiota Alexa Skill.
 
+Self-contained: loads .env from this file's directory (then from cwd) and
+performs ONLY the invoked operation — no connection or side effect on import.
+
+Operations (all return the same envelope):
+    {"ok": True,  "data": <payload>}        success
+    {"ok": False, "error": "<mensagem>"}    failure (tratado, nunca lança)
+
+CLI (standalone usage):
+    python mail.py send --body "texto" [--subject X] [--to DEST] [--from REM]
+    python mail.py list [--limit 10]
+    python mail.py filter <termo> [--limit 10]
+    python mail.py read <uid>
+"""
+import argparse
+import imaplib
+import json
+import logging
+import os
+import smtplib
+from email import message_from_bytes
+from email.header import decode_header, make_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from dotenv import load_dotenv
-import smtplib
-import os
-import logging
+from pathlib import Path
 
-# Load environment variables
-load_dotenv()
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).with_name(".env"))  # envs do próprio módulo
+load_dotenv()                                   # fallback: .env do cwd
+
+TIMEOUT = 10  # segundos — evita estourar o limite do Lambda
 
 logger = logging.getLogger(__name__)
 
 
-def server_smtp() -> smtplib.SMTP:
-    """Create SMTP server connection"""
-    smtp_server = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
-    smtp_port = int(os.getenv('EMAIL_PORT', '587'))
+def _ok(data):
+    return {"ok": True, "data": data}
 
-    try:
-        # Connect to the SMTP server (timeout avoids hanging the Lambda)
-        server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
+
+def _err(message):
+    logger.error("mail.py: %s", message)
+    return {"ok": False, "error": str(message)}
+
+
+def _smtp_conf():
+    """Config SMTP a partir das envs — fail-fast se ausentes."""
+    host = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+    port = int(os.getenv("EMAIL_PORT", "587"))
+    user = os.getenv("EMAIL_SENDER")
+    password = os.getenv("EMAIL_PASSWORD")
+    if not user or not password:
+        raise ValueError("Credenciais SMTP ausentes: defina EMAIL_SENDER e EMAIL_PASSWORD")
+    return host, port, user, password
+
+
+def _imap_conf():
+    """Config IMAP: EMAIL_IMAP_HOST/PORT ou derivado do EMAIL_HOST (smtp.→imap.)."""
+    host = os.getenv("EMAIL_IMAP_HOST") or os.getenv("EMAIL_HOST", "imap.gmail.com").replace("smtp.", "imap.", 1)
+    port = int(os.getenv("EMAIL_IMAP_PORT", "993"))
+    user = os.getenv("EMAIL_SENDER")
+    password = os.getenv("EMAIL_PASSWORD")
+    if not user or not password:
+        raise ValueError("Credenciais IMAP ausentes: defina EMAIL_SENDER e EMAIL_PASSWORD")
+    return host, port, user, password
+
+
+def _connect_smtp():
+    host, port, user, password = _smtp_conf()
+    if port == 465:
+        server = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT)
+    else:
+        server = smtplib.SMTP(host, port, timeout=TIMEOUT)
         server.starttls()
-        return server
-    except Exception as e:
-        logger.error(f"Error connecting to SMTP server: {e}")
-        raise
+    server.login(user, password)
+    return server
 
 
-def connect_smtp() -> smtplib.SMTP:
-    """Authenticate SMTP connection"""
-    login = os.getenv('EMAIL_SENDER')
-    password = os.getenv('EMAIL_PASSWORD')
-    
-    if not login or not password:
-        raise ValueError("Email credentials not found in environment variables")
-    
+def _decode(value):
     try:
-        server = server_smtp()
-        server.login(login, password)
-        return server
-    except Exception as e:
-        logger.error(f"Error authenticating SMTP connection: {e}")
-        raise
+        return str(make_header(decode_header(value or "")))
+    except Exception:
+        return value or ""
 
 
-def send_email(from_email, to_email, subject, body):
-    """
-    Send email via SMTP with validation and error handling
-    
-    Args:
-        from_email (str): Sender email address
-        to_email (str): Recipient email address  
-        subject (str): Email subject
-        body (str): Email body content
-        
-    Returns:
-        str: Success or error message
-    """
-    # Basic email validation
-    if not all([from_email, to_email, subject, body]):
-        return "Erro: Todos os campos (remetente, destinatário, assunto, corpo) são obrigatórios"
-    
-    if '@' not in from_email or '@' not in to_email:
-        return "Erro: Endereços de email inválidos"
+def _body_text(message):
+    for part in message.walk():
+        if part.get_content_type() == "text/plain" and not part.get_filename():
+            payload = part.get_payload(decode=True) or b""
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                return payload.decode(charset, errors="replace")
+            except LookupError:
+                return payload.decode("utf-8", errors="replace")
+    return ""
 
-    # Create the email message
-    msg = MIMEMultipart()
-    msg['From'] = from_email
-    msg['To'] = to_email
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+def _fetch_messages(criteria, limit, with_body):
+    """Busca mensagens da INBOX (mais recentes primeiro) via IMAP."""
+    host, port, user, password = _imap_conf()
+    with imaplib.IMAP4_SSL(host, port, timeout=TIMEOUT) as imap:
+        imap.login(user, password)
+        imap.select("INBOX", readonly=True)
+        status, data = imap.uid("search", None, criteria)
+        if status != "OK":
+            raise RuntimeError(f"Busca IMAP falhou (status {status})")
+        uids = data[0].split()[::-1][:limit]
+        messages = []
+        for uid in uids:
+            _, fetched = imap.uid("fetch", uid, "(RFC822)" if with_body else "(BODY.PEEK[HEADER])")
+            if not fetched or not fetched[0]:
+                continue
+            raw = fetched[0][1]
+            message = message_from_bytes(raw)
+            item = {
+                "uid": uid.decode(),
+                "from": _decode(message.get("From")),
+                "subject": _decode(message.get("Subject")),
+                "date": _decode(message.get("Date")),
+            }
+            if with_body:
+                item["body"] = _body_text(message)
+            messages.append(item)
+        return messages
+
+
+# --------------------------------------------------------------------------
+# Operações públicas (envelope uniforme)
+# --------------------------------------------------------------------------
+
+def send_email(from_email=None, to_email=None, subject=None, body=None):
+    """Envia e-mail via SMTP. Defaults vêm das envs (EMAIL_SENDER/RECIPIENT/SUBJECT)."""
+    from_email = from_email or os.getenv("EMAIL_SENDER")
+    to_email = to_email or os.getenv("EMAIL_RECIPIENT") or from_email
+    subject = subject or os.getenv("EMAIL_SUBJECT", "Mensagem do Idiota")
+    if not body or not body.strip():
+        return _err("Corpo do e-mail (body) é obrigatório")
+    if not from_email or "@" not in from_email:
+        return _err("Remetente inválido ou ausente (EMAIL_SENDER)")
+    if not to_email or "@" not in to_email:
+        return _err("Destinatário inválido ou ausente")
 
     try:
-        # Send the email
-        server = connect_smtp()
-        server.sendmail(from_email, to_email, msg.as_string())
-        server.quit()
-        logger.info(f"Email sent successfully from {from_email} to {to_email}")
-        return f"Email enviado com sucesso para {to_email}"
-    except ValueError as ve:
-        logger.error(f"Configuration error: {ve}")
-        return "Erro de configuração do email"
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
-        return f"Falha ao enviar email: {str(e)}"
+        message = MIMEMultipart()
+        message["From"] = from_email
+        message["To"] = to_email
+        message["Subject"] = subject
+        message.attach(MIMEText(body, "plain", "utf-8"))
+
+        with _connect_smtp() as server:
+            server.sendmail(from_email, [to_email], message.as_string())
+        logger.info("E-mail enviado: %s -> %s", from_email, to_email)
+        return _ok(f"E-mail enviado com sucesso para {to_email}")
+    except ValueError as e:
+        return _err(e)
+    except smtplib.SMTPAuthenticationError:
+        return _err("Autenticação SMTP falhou: verifique EMAIL_SENDER/EMAIL_PASSWORD (use senha de app)")
+    except (smtplib.SMTPException, OSError) as e:
+        return _err(f"Falha ao enviar e-mail: {e}")
+
+
+def list_emails(limit=10):
+    """Lista os e-mails mais recentes da caixa de entrada (sem corpo)."""
+    try:
+        limit = max(1, int(limit))
+        return _ok(_fetch_messages("ALL", limit, with_body=False))
+    except ValueError as e:
+        return _err(e)
+    except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
+        return _err(f"Falha ao listar e-mails: {e}")
+
+
+def filter_emails(term, limit=10):
+    """Filtra e-mails recentes por termo em remetente ou assunto."""
+    if not term or not term.strip():
+        return _err("Informe um termo para filtrar")
+    try:
+        limit = max(1, int(limit))
+        messages = _fetch_messages("ALL", max(limit * 5, 50), with_body=False)
+        needle = term.strip().lower()
+        hits = [m for m in messages
+                if needle in m["from"].lower() or needle in m["subject"].lower()]
+        return _ok(hits[:limit])
+    except ValueError as e:
+        return _err(e)
+    except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
+        return _err(f"Falha ao filtrar e-mails: {e}")
+
+
+def read_email(uid):
+    """Lê um e-mail completo (com corpo) pelo UID."""
+    if not uid or not str(uid).strip().isdigit():
+        return _err("UID inválido: informe o número retornado por list/filter")
+    try:
+        host, port, user, password = _imap_conf()
+        with imaplib.IMAP4_SSL(host, port, timeout=TIMEOUT) as imap:
+            imap.login(user, password)
+            imap.select("INBOX", readonly=True)
+            status, fetched = imap.uid("fetch", str(uid).strip().encode(), "(RFC822)")
+            if status != "OK" or not fetched or not fetched[0]:
+                return _err(f"E-mail com UID {uid} não encontrado")
+            message = message_from_bytes(fetched[0][1])
+            return _ok({
+                "uid": str(uid).strip(),
+                "from": _decode(message.get("From")),
+                "to": _decode(message.get("To")),
+                "subject": _decode(message.get("Subject")),
+                "date": _decode(message.get("Date")),
+                "body": _body_text(message),
+            })
+    except ValueError as e:
+        return _err(e)
+    except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
+        return _err(f"Falha ao ler e-mail: {e}")
+
+
+# --------------------------------------------------------------------------
+# CLI standalone — executa apenas a função invocada
+# --------------------------------------------------------------------------
+
+def _cli():
+    parser = argparse.ArgumentParser(description="mail.py: enviar, listar, filtrar e ler e-mails (standalone)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    cmd_send = sub.add_parser("send", help="envia um e-mail")
+    cmd_send.add_argument("--from", dest="from_email", help="remetente (default: EMAIL_SENDER)")
+    cmd_send.add_argument("--to", dest="to_email", help="destinatário (default: EMAIL_RECIPIENT)")
+    cmd_send.add_argument("--subject", help="assunto (default: EMAIL_SUBJECT)")
+    cmd_send.add_argument("--body", required=True, help="corpo do e-mail")
+
+    cmd_list = sub.add_parser("list", help="lista os e-mails recentes")
+    cmd_list.add_argument("--limit", type=int, default=10)
+
+    cmd_filter = sub.add_parser("filter", help="filtra por termo (remetente/assunto)")
+    cmd_filter.add_argument("term")
+    cmd_filter.add_argument("--limit", type=int, default=10)
+
+    cmd_read = sub.add_parser("read", help="lê um e-mail completo pelo UID")
+    cmd_read.add_argument("uid")
+
+    args = parser.parse_args()
+    if args.cmd == "send":
+        result = send_email(args.from_email, args.to_email, args.subject, args.body)
+    elif args.cmd == "list":
+        result = list_emails(args.limit)
+    elif args.cmd == "filter":
+        result = filter_emails(args.term, args.limit)
+    else:
+        result = read_email(args.uid)
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    _cli()

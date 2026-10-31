@@ -66,6 +66,8 @@ jobs:
         if: steps.cfg.outputs.available == 'true'
         env:
           ASK_SKILL_ID: ${{ secrets.ASK_SKILL_ID }}
+          ASK_LWA_CLIENT_ID: ${{ secrets.ASK_LWA_CLIENT_ID }}
+          ASK_LWA_CLIENT_CONFIRMATION: ${{ secrets.ASK_LWA_CLIENT_CONFIRMATION }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
           MAX_HISTORY: ${{ secrets.MAX_HISTORY }}
