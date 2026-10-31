@@ -8,11 +8,22 @@ Operations (all return the same envelope):
     {"ok": True,  "data": <payload>}        success
     {"ok": False, "error": "<mensagem>"}    failure (tratado, nunca lança)
 
+send_email EXIGE título (subject), corpo (body) e remetente (from_email ou
+EMAIL_SENDER no ambiente) — sem defaults silenciosos. O título pode ser
+sugerido no fim do fluxo, quando o corpo já existe: suggest_subject(body).
+
+    list_emails([n])           caixa de entrada COMPLETA em blocos: remetente,
+                               assunto, data, corpo integral e links extraídos
+    list_addresses([termo])    SOMENTE endereços de e-mail (sem mensagem), dedupe
+    format_email_blocks(items) apresenta os e-mails em blocos legíveis
+
 CLI (standalone usage):
     python mail.py send --body "texto" [--subject X] [--to DEST] [--from REM]
-    python mail.py list [--limit 10]
-    python mail.py filter <termo> [--limit 10]
-    python mail.py read <uid>
+        (--subject ausente é sugerido do corpo via suggest_subject)
+    python mail.py list [--limit 10] [--headers-only] [--json]
+    python mail.py addresses [termo] [--limit 50] [--json]
+    python mail.py filter <termo> [--limit 10] [--json]
+    python mail.py read <uid> [--json]
 """
 import argparse
 import base64
@@ -20,6 +31,7 @@ import imaplib
 import json
 import logging
 import os
+import re
 import smtplib
 import time
 import urllib.error
@@ -29,6 +41,8 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import getaddresses
+from html.parser import HTMLParser
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -158,16 +172,83 @@ def _decode(value):
         return value or ""
 
 
+class _HTMLText(HTMLParser):
+    """Extrai o texto visível de um e-mail HTML (ignora script/style/head)."""
+
+    SKIP = {"script", "style", "head", "title"}
+    BREAK = {"br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4", "table"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip += 1
+        elif tag in self.BREAK:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if not self._skip and data.strip():
+            self.parts.append(data)
+
+
+def _html_to_text(html):
+    """Texto legível de um corpo HTML ("" se o parser falhar)."""
+    parser = _HTMLText()
+    try:
+        parser.feed(html or "")
+    except Exception:
+        return ""
+    return re.sub(r"\s+", " ", "".join(parser.parts)).strip()
+
+
+def _decode_part(part):
+    payload = part.get_payload(decode=True) or b""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
 def _body_text(message):
+    """Corpo em texto puro; se o e-mail for só HTML, extrai o texto visível."""
+    text = ""
+    html = ""
     for part in message.walk():
-        if part.get_content_type() == "text/plain" and not part.get_filename():
-            payload = part.get_payload(decode=True) or b""
-            charset = part.get_content_charset() or "utf-8"
-            try:
-                return payload.decode(charset, errors="replace")
-            except LookupError:
-                return payload.decode("utf-8", errors="replace")
-    return ""
+        if part.get_filename():
+            continue
+        ctype = part.get_content_type()
+        if ctype == "text/plain" and not text:
+            text = _decode_part(part)
+        elif ctype == "text/html" and not html:
+            html = _decode_part(part)
+    return text or _html_to_text(html)
+
+
+def _extract_links(message, max_links=10):
+    """Links http(s) presentes no corpo (texto puro e hrefs do HTML), dedupe."""
+    chunks = []
+    for part in message.walk():
+        if part.get_filename():
+            continue
+        if part.get_content_type() in ("text/plain", "text/html"):
+            chunks.append(_decode_part(part))
+    links = []
+    for text in chunks:
+        for url in re.findall(r"https?://[^\s<>\"'()]+", text or ""):
+            url = url.rstrip(".,;:!?")
+            if url and url not in links:
+                links.append(url)
+            if len(links) >= max_links:
+                return links
+    return links
 
 
 def _fetch_messages(criteria, limit, with_body):
@@ -192,6 +273,7 @@ def _fetch_messages(criteria, limit, with_body):
             }
             if with_body:
                 item["body"] = _body_text(message)
+                item["links"] = _extract_links(message)
             messages.append(item)
         return messages
 
@@ -200,15 +282,47 @@ def _fetch_messages(criteria, limit, with_body):
 # Operações públicas (envelope uniforme)
 # --------------------------------------------------------------------------
 
-def send_email(from_email=None, to_email=None, subject=None, body=None):
-    """Envia e-mail via SMTP. Defaults vêm das envs (EMAIL_SENDER/RECIPIENT/SUBJECT)."""
+def suggest_subject(body, max_len=48):
+    """Sugere um título curto a partir do corpo (fim do fluxo, corpo já conhecido).
+
+    Heurística local (sem rede): primeira frase; se curta demais, o texto todo;
+    corta em limite de palavras com reticências. Corpo vazio -> "".
+    """
+    text = re.sub(r"\s+", " ", str(body or "")).strip()
+    if not text:
+        return ""
+    first = re.split(r"[.!?;\n]", text, maxsplit=1)[0].strip()
+    if len(first) < 4:
+        first = text
+    if len(first) > max_len:
+        cut = first[:max_len]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        first = cut.rstrip(",;: ") + "…"
+    return first
+
+
+def send_email(subject=None, body=None, from_email=None, to_email=None):
+    """Envia e-mail via SMTP — EXIGE título, corpo e remetente.
+
+    subject: obrigatório (sem default silencioso; sugira com suggest_subject)
+    body:    obrigatório
+    from_email: obrigatório — explícito ou EMAIL_SENDER no ambiente
+    to_email:   explícito, EMAIL_RECIPIENT no ambiente, ou o próprio remetente
+    """
+    subject = str(subject or "").strip()
+    body = str(body or "").strip()
     from_email = from_email or os.getenv("EMAIL_SENDER")
     to_email = to_email or os.getenv("EMAIL_RECIPIENT") or from_email
-    subject = subject or os.getenv("EMAIL_SUBJECT", "Mensagem do Idiota")
-    if not body or not body.strip():
+
+    if not body:
         return _err("Corpo do e-mail (body) é obrigatório")
-    if not from_email or "@" not in from_email:
-        return _err("Remetente inválido ou ausente (EMAIL_SENDER)")
+    if not subject:
+        return _err("Assunto (título) do e-mail é obrigatório — sugira com suggest_subject(body)")
+    if not from_email:
+        return _err("Remetente ausente: passe from_email ou defina EMAIL_SENDER")
+    if "@" not in from_email:
+        return _err(f"Remetente inválido: {from_email}")
     if not to_email or "@" not in to_email:
         return _err("Destinatário inválido ou ausente")
 
@@ -231,15 +345,63 @@ def send_email(from_email=None, to_email=None, subject=None, body=None):
         return _err(f"Falha ao enviar e-mail: {e}")
 
 
-def list_emails(limit=10):
-    """Lista os e-mails mais recentes da caixa de entrada (sem corpo)."""
+def list_emails(limit=10, with_body=True):
+    """Lista os e-mails recentes da caixa de entrada COMPLETOS por padrão:
+    remetente, assunto, data, corpo integral e links extraídos.
+    with_body=False devolve só cabeçalhos (leve, para uso interno)."""
     try:
         limit = max(1, int(limit))
-        return _ok(_fetch_messages("ALL", limit, with_body=False))
+        return _ok(_fetch_messages("ALL", limit, with_body=with_body))
     except ValueError as e:
         return _err(e)
     except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
         return _err(f"Falha ao listar e-mails: {e}")
+
+
+def list_addresses(term=None, limit=50):
+    """Lista SOMENTE os endereços de e-mail (sem mensagem), dedupe, da caixa
+    de entrada recente. Filtro opcional por termo (no endereço ou no nome)."""
+    try:
+        limit = max(1, int(limit))
+        scan = max(limit * 5, 50)
+        messages = _fetch_messages("ALL", scan, with_body=False)
+        needle = (term or "").strip().lower()
+        addresses, seen = [], set()
+        for m in messages:
+            for _name, addr in getaddresses([m["from"]]):
+                addr = (addr or "").strip().lower()
+                if "@" not in addr or addr in seen:
+                    continue
+                if needle and needle not in addr and needle not in m["from"].lower():
+                    continue
+                seen.add(addr)
+                addresses.append(addr)
+                if len(addresses) >= limit:
+                    return _ok(addresses)
+        return _ok(addresses)
+    except ValueError as e:
+        return _err(e)
+    except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
+        return _err(f"Falha ao listar endereços: {e}")
+
+
+def format_email_blocks(items):
+    """Apresenta e-mails em blocos legíveis (um por e-mail, tudo completo)."""
+    blocks = []
+    for i, m in enumerate(items, 1):
+        links = m.get("links") or []
+        body = re.sub(r"[ \t]+", " ", m.get("body", "") or "").strip()
+        block = (
+            f"{'─' * 56}\n"
+            f"[{i}] UID {m.get('uid', '?')}\n"
+            f"De:      {m.get('from', '—')}\n"
+            f"Assunto: {m.get('subject', '—')}\n"
+            f"Data:    {m.get('date', '—')}\n"
+            f"Links:   {', '.join(links) if links else '—'}\n"
+            f"Corpo:\n{body or '—'}"
+        )
+        blocks.append(block)
+    return "\n\n".join(blocks) if blocks else "Nenhum e-mail na caixa de entrada."
 
 
 def filter_emails(term, limit=10):
@@ -276,6 +438,7 @@ def read_email(uid):
                 "subject": _decode(message.get("Subject")),
                 "date": _decode(message.get("Date")),
                 "body": _body_text(message),
+                "links": _extract_links(message),
             })
     except ValueError as e:
         return _err(e)
@@ -288,35 +451,59 @@ def read_email(uid):
 # --------------------------------------------------------------------------
 
 def _cli():
-    parser = argparse.ArgumentParser(description="mail.py: enviar, listar, filtrar e ler e-mails (standalone)")
+    parser = argparse.ArgumentParser(
+        description="mail.py standalone: enviar e-mails, listar caixa em blocos, "
+                    "listar endereços e ler mensagens")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     cmd_send = sub.add_parser("send", help="envia um e-mail")
     cmd_send.add_argument("--from", dest="from_email", help="remetente (default: EMAIL_SENDER)")
     cmd_send.add_argument("--to", dest="to_email", help="destinatário (default: EMAIL_RECIPIENT)")
-    cmd_send.add_argument("--subject", help="assunto (default: EMAIL_SUBJECT)")
+    cmd_send.add_argument("--subject", help="assunto (ausente: sugerido do corpo)")
     cmd_send.add_argument("--body", required=True, help="corpo do e-mail")
 
-    cmd_list = sub.add_parser("list", help="lista os e-mails recentes")
+    cmd_list = sub.add_parser("list", help="lista e-mails COMPLETOS em blocos (corpo, links, remetente)")
     cmd_list.add_argument("--limit", type=int, default=10)
+    cmd_list.add_argument("--headers-only", action="store_true", help="sem corpo/links (leve)")
+    cmd_list.add_argument("--json", action="store_true", help="saída JSON em vez de blocos")
 
-    cmd_filter = sub.add_parser("filter", help="filtra por termo (remetente/assunto)")
+    cmd_addr = sub.add_parser("addresses", help="lista somente endereços de e-mail (filtro opcional)")
+    cmd_addr.add_argument("term", nargs="?", default=None, help="filtro (endereço ou nome)")
+    cmd_addr.add_argument("--limit", type=int, default=50)
+    cmd_addr.add_argument("--json", action="store_true")
+
+    cmd_filter = sub.add_parser("filter", help="filtra e-mails por termo (remetente/assunto)")
     cmd_filter.add_argument("term")
     cmd_filter.add_argument("--limit", type=int, default=10)
+    cmd_filter.add_argument("--json", action="store_true")
 
     cmd_read = sub.add_parser("read", help="lê um e-mail completo pelo UID")
     cmd_read.add_argument("uid")
+    cmd_read.add_argument("--json", action="store_true")
 
     args = parser.parse_args()
+    human = None
     if args.cmd == "send":
-        result = send_email(args.from_email, args.to_email, args.subject, args.body)
+        subject = args.subject or suggest_subject(args.body)
+        result = send_email(subject=subject, body=args.body,
+                            from_email=args.from_email, to_email=args.to_email)
     elif args.cmd == "list":
-        result = list_emails(args.limit)
+        result = list_emails(args.limit, with_body=not args.headers_only)
+        if result.get("ok") and not args.json:
+            human = format_email_blocks(result["data"])
+    elif args.cmd == "addresses":
+        result = list_addresses(args.term, args.limit)
+        if result.get("ok") and not args.json:
+            human = "\n".join(f"• {a}" for a in result["data"]) or "Nenhum endereço encontrado."
     elif args.cmd == "filter":
         result = filter_emails(args.term, args.limit)
+        if result.get("ok") and not args.json:
+            human = format_email_blocks(result["data"])
     else:
         result = read_email(args.uid)
-    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        if result.get("ok") and not args.json:
+            human = format_email_blocks([result["data"]])
+    print(human if human is not None else json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 
 if __name__ == "__main__":

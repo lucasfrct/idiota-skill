@@ -61,29 +61,39 @@ def reset_state():
 # Gerador determinístico de dataset
 # ---------------------------------------------------------------------------
 
+def iso(dt):
+    return dt.isoformat(timespec="microseconds")
+
+
 def gen_dataset(seed, n_sent, n_errors, n_recipients, n_registry):
-    """Dataset conhecido — a referência deriva daqui (não do arquivo)."""
+    """Dataset conhecido — a referência deriva daqui (não do arquivo).
+
+    Timestamps relativos a agora, espalhados numa janela de 6 dias — frescos
+    para o TTL default de 7 dias (o TTL é testado em test_cache_ttl.py).
+    """
     rng = random.Random(seed)
-    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    base = datetime.now(timezone.utc) - timedelta(days=6)
+    total = max(1, n_sent + n_errors)
+    span_us = 6 * 24 * 3600 * 1_000_000
     recips = [f"user{i}@ex.com" for i in range(n_recipients)]
 
-    def stamp(i):
-        return (base + timedelta(microseconds=i * 137 + rng.randrange(1000))).isoformat()
+    def stamp(pos):
+        return iso(base + timedelta(microseconds=(pos * span_us) // total
+                                    + rng.randrange(1_000_000)))
 
     def mk(i, pool):
         to = recips[rng.randrange(n_recipients)]
         subject = f"{pool} assunto {rng.choice(['voo', 'hotel', ' conta', 'BOLETO'])} {i % 97}"
         body = f"corpo da mensagem {i} com token{rng.randrange(50)} e mais texto"
+        pos = i if pool == "sent" else n_sent + i
         rec = {"id": i, "to": to, "subject": subject, "body": body,
-               "at": stamp(i), "info" if pool == "sent" else "error": f"r{i}"}
+               "at": stamp(pos), "info" if pool == "sent" else "error": f"r{i}"}
         return rec
 
     sent = [mk(i, "sent") for i in range(n_sent)]
     errors = [mk(10_000 + i, "errors") for i in range(n_errors)]
-    now = base.isoformat()
-    registry = [{"email": f"reg{i}@ex.com", "first_used": now,
-                 "last_used": (base + timedelta(microseconds=i)).isoformat(),
-                 "count": i + 1}
+    registry = [{"email": f"reg{i}@ex.com", "first_used": iso(base),
+                 "last_used": stamp(i), "count": i + 1}
                 for i in range(n_registry)]
     registry.sort(key=lambda r: r["last_used"], reverse=True)  # invariante do cache
     return {"seq": n_sent + n_errors, "registry": registry, "sent": sent, "errors": errors}
@@ -188,7 +198,8 @@ def s2_external_edit():
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     data["sent"].append({"id": 999999, "to": "externo@ex.com", "subject": "externo",
-                         "body": "b", "at": "2026-12-31", "info": ""})
+                         "body": "b", "at": iso(datetime.now(timezone.utc) + timedelta(days=30)),
+                         "info": ""})
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f)
     time.sleep(0.01)
@@ -324,9 +335,10 @@ section("S4 — piores casos")
 # ===========================================================================
 
 def s4_hot_recipient():
+    now_iso = iso(datetime.now(timezone.utc))
     hot = {"seq": 5000, "registry": [], "errors": [],
            "sent": [{"id": i, "to": "hot@ex.com", "subject": f"h{i}",
-                     "body": "corpo", "at": "2026-01-01", "info": ""}
+                     "body": "corpo", "at": now_iso, "info": ""}
                     for i in range(5000)]}
     cache.write_json(cache.EMAILS, hot)
     # best-of-2: a 1ª busca pós-write pode pagar GC/alocação do dataset anterior

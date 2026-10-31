@@ -12,6 +12,9 @@ Mecânica:
   e edições externas no arquivo são detectadas e recarregadas.
 - Índice por destinatário (dict) para busca O(1) + varredura em memória para
   texto — reconstruído automaticamente a cada escrita/recarga.
+- TTL: entradas com mais de CACHE_TTL_DAYS dias (default 7) expiram — filtro
+  na leitura (nada expirado aparece) e purga na escrita (arquivo enxuto).
+  CACHE_TTL_DAYS=0 desativa. Timestamp ilegível nunca expira.
 - Fail-open: nenhuma função lança exceção — cache é auxiliar e nunca derruba
   a skill; em falha retorna valor seguro (default / False / lista vazia).
 
@@ -27,7 +30,7 @@ import os
 import re
 import tempfile
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,7 @@ MAX_SENT = int(os.getenv("CACHE_MAX_SENT", "500"))
 MAX_ERRORS = int(os.getenv("CACHE_MAX_ERRORS", "200"))
 MAX_EMAILS = int(os.getenv("CACHE_MAX_EMAILS", "200"))
 BODY_MAX = int(os.getenv("CACHE_BODY_MAX", "2000"))
+TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "7"))  # 0 desativa a expiração
 
 CHATS = "chats"
 EMAILS = "emails"
@@ -52,6 +56,26 @@ _email_index = {"gen": -1, "sent": {}, "errors": {}}
 def _now() -> str:
     # microssegundos: ordenação correta entre registros do mesmo segundo
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _cutoff() -> str:
+    """ISO cutoff: tudo anterior expirou (TTL_DAYS; <= 0 desativa)."""
+    if TTL_DAYS <= 0:
+        return ""
+    return (datetime.now(timezone.utc) - timedelta(days=TTL_DAYS)).isoformat(
+        timespec="microseconds")
+
+
+def _expired(ts, cutoff: str = None) -> bool:
+    """True se ts < cutoff. Timestamp ilegível NUNCA expira (não destruir dado)."""
+    if cutoff is None:
+        cutoff = _cutoff()
+    if not cutoff or not ts:
+        return False
+    try:
+        return datetime.fromisoformat(str(ts)) < datetime.fromisoformat(cutoff)
+    except (TypeError, ValueError):
+        return False
 
 
 def _path(name: str) -> str:
@@ -133,20 +157,23 @@ def update_json(name: str, fn, default=None):
 # ---------------------------------------------------------------------------
 
 def load_chat(user_id: str) -> list:
-    """Chat history previously persisted for this user ([] if none)."""
+    """Chat history previously persisted for this user ([] if none/expired)."""
     try:
         user_id = str(user_id or "").strip()
         if not user_id:
             return []
         data = read_json(CHATS, default={}) or {}
-        return list(data.get(user_id, {}).get("history", []))
+        entry = data.get(user_id)
+        if not entry or _expired(entry.get("updated")):
+            return []
+        return list(entry.get("history", []))
     except Exception as e:
         logger.error("cache: load_chat failed: %s", e)
         return []
 
 
 def save_chat(user_id: str, history: list) -> bool:
-    """Persist chat history for a user (bounded; evicts oldest users)."""
+    """Persist chat history for a user (bounded; evicts oldest/expired users)."""
     try:
         user_id = str(user_id or "").strip()
         if not user_id:
@@ -155,6 +182,10 @@ def save_chat(user_id: str, history: list) -> bool:
 
         def fn(data):
             data = dict(data or {})
+            cutoff = _cutoff()
+            if cutoff:  # purge de usuários expirados (o atual entra fresco já já)
+                data = {k: v for k, v in data.items()
+                        if k == user_id or not _expired((v or {}).get("updated"), cutoff)}
             now = _now()
             data[user_id] = {"history": turns, "updated": now}
             if len(data) > max(1, MAX_USERS):
@@ -210,8 +241,16 @@ def _touch_registry(data, email: str, now: str):
 
 
 def _trim(data):
+    """Purge expired (TTL) then trim to caps — keeps the file bounded."""
+    cutoff = _cutoff()
+    if cutoff:
+        data["sent"] = [e for e in data.get("sent", []) if not _expired(e.get("at"), cutoff)]
+        data["errors"] = [e for e in data.get("errors", []) if not _expired(e.get("at"), cutoff)]
+        data["registry"] = [r for r in data.get("registry", [])
+                            if not _expired(r.get("last_used"), cutoff)]
     data["sent"] = data.get("sent", [])[-max(1, MAX_SENT):]
     data["errors"] = data.get("errors", [])[-max(1, MAX_ERRORS):]
+    data["registry"] = data.get("registry", [])[-max(1, MAX_EMAILS):]
 
 
 def record_email(to_email: str, subject: str = "", body: str = "",
@@ -272,6 +311,9 @@ def _search(data, pool: str, recipient=None, contains=None,
     idx = _index(data)
     if recipient:
         entries = list(idx[pool].get(str(recipient).strip().lower(), []))
+    cutoff = _cutoff()
+    if cutoff:  # TTL: expirados nunca aparecem (índice ou varredura)
+        entries = [e for e in entries if not _expired(e.get("at"), cutoff)]
     entries = list(reversed(entries))  # newest first
     if since:
         entries = [e for e in entries if e.get("at", "") >= since]
@@ -306,14 +348,17 @@ def list_error_emails(recipient=None, contains=None, since=None, limit=20) -> li
 
 
 def list_available_emails(limit=50) -> list:
-    """Registered email addresses, most recently used first."""
+    """Registered email addresses, most recently used first (TTL-filtered)."""
     try:
         limit = max(0, int(limit or 0))
         if limit == 0:
             return []
         with _lock:
             data = read_json(EMAILS, default={}) or {}
+            cutoff = _cutoff()
             registry = data.get("registry", [])
+            if cutoff:
+                registry = [r for r in registry if not _expired(r.get("last_used"), cutoff)]
             return [r["email"] for r in registry[:limit]]
     except Exception as e:
         logger.error("cache: list_available_emails failed: %s", e)

@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from chat import generate_gpt_response
 import chat
 import cache
-from mail import send_email
+from mail import send_email, suggest_subject
 
 # Load environment variables
 load_dotenv()
@@ -29,7 +29,6 @@ logger.setLevel(logging.INFO)
 # Configuration (environment-driven)
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT") or EMAIL_SENDER
-EMAIL_SUBJECT = os.getenv("EMAIL_SUBJECT", "Mensagem do Idiota")
 
 ASK_REPROMPT = "Você pode fazer uma pergunta, pedir para enviar um e-mail, ou dizer sair."
 
@@ -58,8 +57,10 @@ def spoken_email(address: str) -> str:
 def parse_subject_body(message: str):
     """Extract subject and body from a spoken message.
 
-    Supports the pattern 'assunto <subject> mensagem <body>';
-    anything else goes entirely to the body with the default subject.
+    Supports the pattern 'assunto <subject> mensagem <body>'; anything else
+    goes entirely to the body with an empty subject — the title is then
+    SUGGESTED from the body at the end of the flow (ask_email_confirmation),
+    once the body is already known.
     """
     match = re.search(
         r"assunto\s+(?P<subject>.+?)\s*,?\s+(?:mensagem|texto|dizendo)\s+(?P<body>.+)",
@@ -68,7 +69,7 @@ def parse_subject_body(message: str):
     )
     if match:
         return match.group("subject").strip(), match.group("body").strip()
-    return EMAIL_SUBJECT, message.strip()
+    return "", message.strip()
 
 
 def get_email_flow(handler_input):
@@ -86,7 +87,14 @@ def clear_email_flow(handler_input):
 
 
 def ask_email_confirmation(handler_input, subject, body):
-    """Store the pending email and ask the user to confirm"""
+    """Store the pending email and ask the user to confirm.
+
+    Título exigido no envio: se o usuário não disse um, sugere do corpo aqui —
+    fim do fluxo, quando o corpo já existe — e fala a sugestão na confirmação.
+    """
+    subject = str(subject or "").strip()
+    if not subject:
+        subject = suggest_subject(body)
     handler_input.attributes_manager.session_attributes["email_flow"] = {
         "subject": subject,
         "body": body,
@@ -132,7 +140,10 @@ def send_pending_email(handler_input):
         logger.error("Email flow attempted without EMAIL_SENDER/EMAIL_RECIPIENT")
         return "O envio de e-mail não está configurado no ambiente."
 
-    result = send_email(EMAIL_SENDER, EMAIL_RECIPIENT, flow["subject"], flow["body"])
+    # Título é exigência do send_email: fallback de sugestão (corpo já conhecido)
+    subject = str(flow.get("subject") or "").strip() or suggest_subject(flow.get("body", ""))
+    result = send_email(subject=subject, body=flow.get("body", ""),
+                        from_email=EMAIL_SENDER, to_email=EMAIL_RECIPIENT)
     logger.info(f"Email attempt result: {result}")
 
     # Frente 2 do cache: metadados do envio + lista de e-mails disponíveis
@@ -140,7 +151,7 @@ def send_pending_email(handler_input):
     info = (result.get("data") or result.get("error") or "") if isinstance(result, dict) else str(result)
     cache.record_email(
         to_email=EMAIL_RECIPIENT,
-        subject=flow.get("subject", ""),
+        subject=subject,
         body=flow.get("body", ""),
         ok=ok,
         info=str(info),

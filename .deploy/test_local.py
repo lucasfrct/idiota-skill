@@ -107,6 +107,17 @@ def repl():
             s, attrs, _ = call(attrs, "IntentRequest", intent("SendEmailIntent", {"message": line[6:].strip()}))
             say(s)
             continue
+        if low in ("emails", "e-mails"):
+            import mail
+            r = mail.list_emails(5)
+            print(mail.format_email_blocks(r["data"]) if r.get("ok") else r.get("error"))
+            continue
+        if low.startswith("enderecos"):
+            import mail
+            term = line[9:].strip() or None
+            r = mail.list_addresses(term)
+            print("\n".join(f"• {a}" for a in r["data"]) if r.get("ok") else r.get("error"))
+            continue
         s, attrs, end = call(attrs, "IntentRequest", intent("GptQueryIntent", {"query": line}))
         say(s)
 
