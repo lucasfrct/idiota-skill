@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import logging
 
@@ -31,6 +32,17 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT") or EMAIL_SENDER
 
 ASK_REPROMPT = "Você pode fazer uma pergunta, pedir para enviar um e-mail, ou dizer sair."
+
+# Primeira fala ao invocar a skill: uma saudação curta, sorteada a cada launch
+GREETINGS = [
+    "Oi!",
+    "Senhor?",
+    "Como ajudo?",
+    "Só falar.",
+    "Opa!",
+    "Ok!",
+    "Pergunte.",
+]
 
 
 def user_id(handler_input) -> str:
@@ -89,12 +101,22 @@ def is_dictating(handler_input) -> bool:
     return bool(session_attr.get("dictating"))
 
 
-def acknowledge_chunk(handler_input, app):
+def is_conversing(handler_input) -> bool:
+    """Modo conversa contínua (por sessão); conteúdo no cache."""
+    session_attr = handler_input.attributes_manager.session_attributes
+    return bool(session_attr.get("conversing"))
+
+
+def acknowledge_chunk(handler_input, app, conversing=False):
     """Fala curta pós-anotação + mantém a sessão aberta para o próximo trecho."""
-    speak_output = (
-        f"Anotado, parte {app['chunks']}. Continue ditando, ou diga pronto."
-        if app.get("ok") else app.get("error", "Não consegui anotar.")
-    )
+    if app.get("ok"):
+        speak_output = (
+            "Entendi. Continue, ou diga sua vez quando quiser minha resposta."
+            if conversing else
+            f"Anotado, parte {app['chunks']}. Continue ditando, ou diga pronto."
+        )
+    else:
+        speak_output = app.get("error", "Não consegui anotar.")
     return (
         handler_input.response_builder.speak(speak_output)
         .ask("Continuo anotando. Continue.")
@@ -195,22 +217,30 @@ class LaunchRequestHandler(AbstractRequestHandler):
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
         clear_email_flow(handler_input)
-        # Sessão nova = modo ditado desligado (o rascunho persiste no cache —
-        # retomar é explícito: "ditar um e-mail").
+        # Sessão nova = modos ditado/conversa desligados (o rascunho persiste
+        # no cache — retomar é explícito).
         handler_input.attributes_manager.session_attributes.pop("dictating", None)
+        handler_input.attributes_manager.session_attributes.pop("conversing", None)
+        # Retomada: avisa se há ditado/conversa pendente no cache
+        entry = cache.load_dictation_entry(user_id(handler_input))
+        pending = entry.get("chunks", [])
+        hint = ""
+        if pending:
+            kind = ("conversa" if entry.get("mode", "email") == "conversa"
+                    else "ditado de e-mail")
+            hint = (f" Você tem um {kind} em andamento com {len(pending)} anotação(ões) — "
+                    f"diga {'retomar a conversa' if kind == 'conversa' else 'continuar o ditado'} "
+                    "para retomar de onde parou.")
         # Memória de turnos: restaura a conversa anterior do usuário (cache
         # local); se não houver, começa vazia — degradação suave.
         handler_input.attributes_manager.session_attributes["chat_history"] = (
             chat.load_history(user_id(handler_input))
         )
-        speak_output = (
-            "Olá! Sou o Idiota. Pode fazer sua pergunta, "
-            "ditar um e-mail longo, ou pedir para eu enviar um e-mail."
-        )
+        speak_output = random.choice(GREETINGS) + hint
 
         return (
             handler_input.response_builder.speak(speak_output)
-            .ask(speak_output)
+            .ask(ASK_REPROMPT)
             .response
         )
 
@@ -228,11 +258,12 @@ class GptQueryIntentHandler(AbstractRequestHandler):
         try:
             query = ask_utils.get_slot_value(handler_input=handler_input, slot_name="query")
 
-            # Modo ditado: fala livre é ANOTAÇÃO, não pergunta ao GPT.
-            if is_dictating(handler_input):
+            # Modo ditado/conversa: fala livre é ANOTAÇÃO, não pergunta ao GPT.
+            if is_dictating(handler_input) or is_conversing(handler_input):
+                conversing = is_conversing(handler_input)
                 if query:
                     app = chat.dictation_append(user_id(handler_input), query)
-                    return acknowledge_chunk(handler_input, app)
+                    return acknowledge_chunk(handler_input, app, conversing=conversing)
                 speak_output = "Não ouvi o trecho. Fale de novo."
                 return (
                     handler_input.response_builder.speak(speak_output)
@@ -262,6 +293,10 @@ class GptQueryIntentHandler(AbstractRequestHandler):
 
             history = get_history(handler_input)
             uid = user_id(handler_input)
+            # Anota JÁ a fala do usuário: o turno começa gravado no cache
+            # antes do round-trip do GPT (crash-safe — nada do que foi dito
+            # se perde se a execução morrer no meio).
+            chat.annotate_turn(uid, query)
             speak_output = generate_gpt_response(history, query, user_id=uid)
             # Persiste a memória de turnos do usuário no cache local
             chat.save_history(uid, history)
@@ -319,11 +354,18 @@ class StartDictationIntentHandler(AbstractRequestHandler):
         try:
             clear_email_flow(handler_input)
             handler_input.attributes_manager.session_attributes["dictating"] = True
-            uid = user_id(handler_input)
-            chunks = cache.load_dictation(uid)
-            if chunks:
+            handler_input.attributes_manager.session_attributes.pop("conversing", None)
+            started = chat.dictation_start(user_id(handler_input), "email")
+            if not started.get("ok"):
+                speak_output = started.get("error", "Não consegui iniciar o ditado.")
+                return (
+                    handler_input.response_builder.speak(speak_output)
+                    .ask(ASK_REPROMPT)
+                    .response
+                )
+            if started.get("resumed"):
                 speak_output = (
-                    f"Você já tinha {len(chunks)} anotação(ões) guardadas. "
+                    f"Você já tinha {started['chunks']} anotação(ões) guardadas. "
                     "Continuo de onde paramos — fale a próxima parte."
                 )
             else:
@@ -389,12 +431,21 @@ class FinishDictationIntentHandler(AbstractRequestHandler):
         # type: (HandlerInput) -> Response
         try:
             uid = user_id(handler_input)
-            chunks = cache.load_dictation(uid)
+            entry = cache.load_dictation_entry(uid)
+            chunks = entry.get("chunks", [])
             if not chunks:
                 speak_output = "Não há ditado em andamento. Diga: ditar um e-mail, para começar."
                 return (
                     handler_input.response_builder.speak(speak_output)
                     .ask(ASK_REPROMPT)
+                    .response
+                )
+            # Modo conversa: "pronto" também dá a vez ao Idiota (a conversa segue).
+            if entry.get("mode", "email") == "conversa":
+                reply = chat.conversation_reply(uid)
+                return (
+                    handler_input.response_builder.speak(reply)
+                    .ask("Continue a conversa, ou diga sair.")
                     .response
                 )
             draft = chat.dictation_synthesize(uid)
@@ -418,6 +469,82 @@ class FinishDictationIntentHandler(AbstractRequestHandler):
             return (
                 handler_input.response_builder.speak(speak_output)
                 .ask("Tente de novo.")
+                .response
+            )
+
+
+class StartConversationIntentHandler(AbstractRequestHandler):
+    """Conversa contínua: fala livre anotada sem interrupções; 'sua vez'
+    gera a resposta do Idiota sobre todo o contexto. Retomável entre sessões."""
+
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return ask_utils.is_intent_name("StartConversationIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        try:
+            clear_email_flow(handler_input)
+            session_attr = handler_input.attributes_manager.session_attributes
+            session_attr["conversing"] = True
+            session_attr["dictating"] = True  # fala livre roteia para anotação
+            started = chat.dictation_start(user_id(handler_input), "conversa")
+            if not started.get("ok"):
+                speak_output = started.get("error", "Não consegui iniciar a conversa.")
+                return (
+                    handler_input.response_builder.speak(speak_output)
+                    .ask(ASK_REPROMPT)
+                    .response
+                )
+            if started.get("resumed"):
+                speak_output = (
+                    f"Retomando a conversa com {started['chunks']} anotação(ões). "
+                    "Fale à vontade — anoto tudo. Diga 'sua vez' para eu pensar "
+                    "e responder sobre o conjunto."
+                )
+            else:
+                speak_output = (
+                    "Modo conversa ativado. Fale à vontade, em partes — anoto tudo "
+                    "sem interromper. Diga 'sua vez' quando quiser minha resposta "
+                    "completa, ou pronto para encerrarmos."
+                )
+            return (
+                handler_input.response_builder.speak(speak_output)
+                .ask("Estou ouvindo. Continue.")
+                .response
+            )
+        except Exception as e:
+            logger.error(f"Error in StartConversationIntentHandler: {e}")
+            speak_output = "Não consegui iniciar a conversa."
+            return (
+                handler_input.response_builder.speak(speak_output)
+                .ask(ASK_REPROMPT)
+                .response
+            )
+
+
+class MyTurnIntentHandler(AbstractRequestHandler):
+    """'Sua vez': o Idiota pensa sobre toda a transcrição e responde."""
+
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return ask_utils.is_intent_name("MyTurnIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        try:
+            reply = chat.conversation_reply(user_id(handler_input))
+            return (
+                handler_input.response_builder.speak(reply)
+                .ask("Continue a conversa, ou diga sair.")
+                .response
+            )
+        except Exception as e:
+            logger.error(f"Error in MyTurnIntentHandler: {e}")
+            speak_output = "Problema ao responder agora."
+            return (
+                handler_input.response_builder.speak(speak_output)
+                .ask("Continue a conversa.")
                 .response
             )
 
@@ -562,8 +689,10 @@ sb = SkillBuilder()
 
 sb.add_request_handler(LaunchRequestHandler())
 sb.add_request_handler(StartDictationIntentHandler())
+sb.add_request_handler(StartConversationIntentHandler())
 sb.add_request_handler(DictationChunkIntentHandler())
 sb.add_request_handler(FinishDictationIntentHandler())
+sb.add_request_handler(MyTurnIntentHandler())
 sb.add_request_handler(GptQueryIntentHandler())
 sb.add_request_handler(SendEmailIntentHandler())
 sb.add_request_handler(YesIntentHandler())

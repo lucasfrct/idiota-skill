@@ -26,9 +26,10 @@ Coleções:
 - emails.json     — {"registry" (e-mails disponíveis), "sent" (enviados),
                     "errors" (falhas), "seq"} com metadados (para, assunto,
                     mensagem, data, resultado).
-- dictations.json — rascunho de ditado longo por usuário
-                    {user_id: {"chunks", "updated"}} — anotações acumuladas
-                    entre turnos/sessões até "pronto" sintetizar e enviar.
+- dictations.json — rascunho de ditado/conversa contínua por usuário
+                    {user_id: {"chunks", "mode" ("email"|"conversa"),
+                    "started", "updated"}} — fala acumulada entre turnos/
+                    sessões até "pronto" (e-mail) ou "sua vez" (conversa).
 - notes.json      — notas explícitas ("anote que ...") por usuário
                     {user_id: {"notes": [{"text", "at"}], "updated"}}.
 """
@@ -358,28 +359,43 @@ def clear_notes(user_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def load_dictation(user_id: str) -> list:
-    """Ditado acumulado do usuário ([] se não houver/expirado)."""
+    """Chunks do ditado/conversa do usuário ([] se não houver/expirado)."""
+    return (load_dictation_entry(user_id) or {}).get("chunks", [])
+
+
+def load_dictation_entry(user_id: str) -> dict:
+    """Entrada completa do rascunho: {"chunks", "mode", "started", "updated"}."""
     try:
         user_id = str(user_id or "").strip()
         if not user_id:
-            return []
+            return {}
         data = read_json(DICTATIONS, default={}) or {}
         entry = data.get(user_id)
         if not entry or _expired(entry.get("updated")):
-            return []
-        return list(entry.get("chunks", []))
+            return {}
+        entry = dict(entry)
+        entry.setdefault("mode", "email")
+        entry.setdefault("chunks", [])
+        return entry
     except Exception as e:
-        logger.error("cache: load_dictation failed: %s", e)
-        return []
+        logger.error("cache: load_dictation_entry failed: %s", e)
+        return {}
 
 
-def save_dictation(user_id: str, chunks: list) -> bool:
-    """Persist the dictation buffer for a user (bounded; evicts oldest/expired)."""
+def save_dictation(user_id: str, chunks: list, mode=None, started=None) -> bool:
+    """Persist the dictation/conversation buffer (bounded; evicts oldest/expired).
+
+    mode ('email'|'conversa') e started (início da sentada, p/ limite de tempo)
+    são preservados do estado anterior quando não informados.
+    """
     try:
         user_id = str(user_id or "").strip()
         if not user_id:
             return False
         kept = [str(c) for c in (chunks or [])][-max(1, MAX_DICTATION_CHUNKS):]
+        previous = load_dictation_entry(user_id)
+        eff_mode = mode or previous.get("mode", "email")
+        eff_started = started or previous.get("started", "")
 
         def fn(data):
             data = dict(data or {})
@@ -387,7 +403,8 @@ def save_dictation(user_id: str, chunks: list) -> bool:
             if cutoff:
                 data = {k: v for k, v in data.items()
                         if k == user_id or not _expired((v or {}).get("updated"), cutoff)}
-            data[user_id] = {"chunks": kept, "updated": _now()}
+            data[user_id] = {"chunks": kept, "mode": eff_mode,
+                             "started": eff_started, "updated": _now()}
             if len(data) > max(1, MAX_USERS):
                 oldest = sorted(
                     (k for k in data if k != user_id),

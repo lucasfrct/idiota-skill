@@ -123,6 +123,31 @@
             "pode enviar o ditado",
             "terminei de ditar"
           ]
+        },
+        {
+          "name": "StartConversationIntent",
+          "samples": [
+            "vamos conversar",
+            "quero conversar",
+            "conversar com você",
+            "conversar com voce",
+            "bora conversar",
+            "retomar a conversa",
+            "continuar a conversa"
+          ]
+        },
+        {
+          "name": "MyTurnIntent",
+          "samples": [
+            "sua vez",
+            "o que você acha",
+            "o que voce acha",
+            "e você o que acha",
+            "responda isso",
+            "me dê sua opinião",
+            "me de sua opiniao",
+            "pode falar agora"
+          ]
         }
       ],
       "types": [],

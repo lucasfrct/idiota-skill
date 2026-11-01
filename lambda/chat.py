@@ -352,6 +352,25 @@ def clear_history(user_id: str) -> bool:
         return False
 
 
+def annotate_turn(user_id: str, query) -> bool:
+    """Anota IMEDIATAMENTE a fala do usuário como abertura do turno.
+
+    Crash-safe: a fala é gravada no cache ANTES da chamada ao GPT — se a
+    Lambda morrer no meio do round-trip, o que o usuário falou já está
+    anotado e o turno já começou. A resposta entra depois via save_history
+    (que sobrescreve com a lista completa user+assistant, sem duplicar).
+    """
+    if not query or not str(query).strip():
+        return False
+    try:
+        history = load_history(user_id)
+        history.append({"role": "user", "content": str(query).strip(), "at": _now()})
+        return cache.save_chat(user_id, history[-MAX_HISTORY:])
+    except Exception as e:
+        logger.error(f"Turn annotation failed: {e}")
+        return False
+
+
 EMAIL_DRAFT_INSTRUCTIONS = (
     "Você transforma uma mensagem falada em um e-mail curto e pronto para enviar. "
     "Responda EXATAMENTE neste formato, sem markdown e nada além dele:\n"
@@ -416,21 +435,55 @@ def send_composed_email(message, from_email=None, to_email=None):
 
 DICTATION_CHUNK_CHARS = int(os.getenv("DICTATION_CHUNK_CHARS", "600"))
 DICTATION_TOTAL_CHARS = int(os.getenv("DICTATION_TOTAL_CHARS", "24000"))
+DICTATION_MAX_MINUTES = int(os.getenv("DICTATION_MAX_MINUTES", "10"))
+
+
+def dictation_start(user_id: str, mode: str = "email") -> dict:
+    """Inicia (ou retoma) um rascunho no modo dado ('email'|'conversa').
+
+    Recusa se houver rascunho ativo no OUTRO modo (diga pronto/sua vez antes).
+    'started' marca o início da sentada — o limite de 10 min vale por sentada.
+    Retorna {"ok", "mode", "chunks", "resumed"} ou {"ok": False, "error"}.
+    """
+    mode = mode if mode in ("email", "conversa") else "email"
+    entry = cache.load_dictation_entry(user_id)
+    chunks = entry.get("chunks", [])
+    if chunks and entry.get("mode", "email") != mode:
+        return {"ok": False, "error": (
+            f"Há um {'ditado de e-mail' if entry.get('mode') == 'email' else 'modo de conversa'} "
+            "em andamento — diga pronto (ou sua vez) antes de trocar de modo")}
+    resumed = bool(chunks)
+    if not cache.save_dictation(user_id, chunks, mode=mode, started=_now()):
+        return {"ok": False, "error": "Falha ao iniciar o modo"}
+    return {"ok": True, "mode": mode, "chunks": len(chunks), "resumed": resumed}
 
 
 def dictation_append(user_id: str, text) -> dict:
     """Anota um trecho falado no rascunho persistente do usuário (cache).
 
-    Limites: por trecho (DICTATION_CHUNK_CHARS) e total (DICTATION_TOTAL_CHARS).
+    Limites: por trecho (DICTATION_CHUNK_CHARS), total (DICTATION_TOTAL_CHARS)
+    e tempo da sentada (DICTATION_MAX_MINUTES desde dictation_start).
     Retorna {"ok": True, "chunks", "chars"} ou {"ok": False, "error"} — nunca lança.
     """
     text = str(text or "").strip()
     if not text:
         return {"ok": False, "error": "Trecho vazio"}
+    entry = cache.load_dictation_entry(user_id)
+    started = entry.get("started", "")
+    if started:
+        try:
+            elapsed = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(started)).total_seconds()
+            if elapsed > DICTATION_MAX_MINUTES * 60:
+                return {"ok": False, "error": (
+                    f"Tempo da sentada esgotado ({DICTATION_MAX_MINUTES} minutos) — "
+                    "diga pronto (ou sua vez) para a resposta")}
+        except (TypeError, ValueError):
+            pass
     if len(text) > DICTATION_CHUNK_CHARS:
         return {"ok": False, "error": (
             f"Trecho longo demais ({len(text)} caracteres; máximo {DICTATION_CHUNK_CHARS}) — divida em partes")}
-    chunks = cache.load_dictation(user_id)
+    chunks = entry.get("chunks", [])
     total = sum(len(c) for c in chunks) + len(text)
     if total > DICTATION_TOTAL_CHARS:
         return {"ok": False, "error": (
@@ -461,6 +514,46 @@ def dictation_synthesize(user_id: str):
     if not full:
         return None
     return generate_email(full)
+
+
+CONVERSATION_REPLY_MAX = int(os.getenv("CONVERSATION_REPLY_MAX", "500"))
+
+
+def conversation_reply(user_id: str) -> str:
+    """'Sua vez': o GPT pensa sobre TUDO anotado na conversa e responde.
+
+    A resposta entra na transcrição (alternância usuário/Idiota) e a conversa
+    segue aberta. Nunca lança; degrada com mensagem falada.
+    """
+    entry = cache.load_dictation_entry(user_id)
+    chunks = entry.get("chunks", [])
+    if not chunks:
+        return "Não há conversa em andamento para eu responder."
+    transcript = "\n".join(f"- {c}" for c in chunks)
+    try:
+        client = client_gpt()
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                system_instructions(),
+                {"role": "user", "content": (
+                    "Estamos numa conversa contínua e pausada. Abaixo está a "
+                    "transcrição de tudo que o usuário falou (e o que você já "
+                    "respondeu). Produza sua resposta reflexiva e curta (2 a 5 "
+                    "frases) sobre o conjunto, continuando o diálogo.\n\n"
+                    f"TRANSCRIÇÃO:\n{transcript}")},
+            ],
+            max_completion_tokens=max(MAX_TOKENS, CONVERSATION_REPLY_MAX),
+            reasoning_effort="none",
+        )
+        reply = sanitize_for_tts(response.choices[0].message.content or "")
+        if not reply:
+            return "Pensei, mas não cheguei a uma resposta. Continue falando."
+        cache.save_dictation(user_id, chunks + [f"Idiota: {reply}"])
+        return reply
+    except Exception as e:
+        logger.error(f"conversation_reply failed: {e}")
+        return "Tive um problema para pensar agora. Continue falando."
 
 
 # ---------------------------------------------------------------------------
