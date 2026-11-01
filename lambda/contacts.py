@@ -319,8 +319,15 @@ def _cli():
                 tel = ", ".join(c.get("telefones", [])) or "—"
                 em = ", ".join(c.get("emails", [])) or "—"
                 org = c.get("empresa") or "—"
+                extras = []
+                if c.get("cargo"):
+                    extras.append(f"cargo: {c['cargo']}")
+                if c.get("endereco"):
+                    extras.append(f"endereço: {c['endereco']}")
+                extras.extend(c.get("outros", []))
+                extra_s = (" | " + " | ".join(extras)) if extras else ""
                 lines.append(f"• {c.get('nome') or em} | empresa: {org} | tel: {tel} "
-                             f"| e-mail: {em} | ({c.get('fonte')})")
+                             f"| e-mail: {em}{extra_s} | ({c.get('fonte')})")
             print("\n".join(lines) or "Nenhum contato encontrado.")
             return
     else:
