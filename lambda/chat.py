@@ -393,7 +393,8 @@ def _tool_payload(name: str, arguments: str, user_id: str = "") -> dict:
             return {"erro": result.get("error", "contato não encontrado")}
         d = result.get("data") or {}
         return {"nome": d.get("nome", ""), "telefones": d.get("telefones", []),
-                "emails": d.get("emails", []), "fonte": d.get("fonte", "")}
+                "emails": d.get("emails", []), "empresa": d.get("empresa", ""),
+                "fonte": d.get("fonte", "")}
     elif name == "read_email":
         uid = str(args.get("uid") or "").strip()
         position = args.get("position")
