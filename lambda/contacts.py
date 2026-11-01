@@ -133,7 +133,8 @@ def list_contacts(user_id: str, term=None, limit=50):
         needle = (term or "").strip()
         local = cache.search_contacts(user_id, needle, limit=limit)
         items = [{"nome": c.get("nome", ""), "email": c.get("email", ""),
-                  "telefones": [], "emails": [c.get("email", "")] if c.get("email") else [],
+                  "telefones": c.get("telefones", []),
+                  "emails": [c.get("email", "")] if c.get("email") else [],
                   "fonte": "cache"} for c in local]
         if _google_enabled() and len(items) < limit:
             try:
