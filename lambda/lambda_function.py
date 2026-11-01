@@ -36,7 +36,7 @@ ASK_REPROMPT = "Você pode fazer uma pergunta, pedir para enviar um e-mail, ou d
 # Primeira fala ao invocar a skill: uma saudação curta, sorteada a cada launch
 GREETINGS = [
     "Oi!",
-    "Senhor?",
+    "Senhor",
     "Como ajudo?",
     "Só falar.",
     "Opa!",
