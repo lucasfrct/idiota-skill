@@ -260,7 +260,8 @@ def list_contacts(user_id: str, term=None, limit=50):
                     if not key or key in seen:
                         continue
                     if needle and needle.lower() not in (
-                            c.get("nome", "") + " " + " ".join(emails)).lower():
+                            c.get("nome", "") + " " + " ".join(emails) + " "
+                            + c.get("empresa", "") + " " + c.get("cargo", "")).lower():
                         continue
                     seen.add(key)
                     items.append({"nome": c.get("nome", ""), "email": emails[0] if emails else "",

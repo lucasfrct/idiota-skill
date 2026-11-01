@@ -65,6 +65,10 @@ def system_instructions():
         "mostre ao usuário e SÓ chame send_email depois de confirmação clara; "
         "se faltar destinatário, pergunte antes. "
         "Você também pode listar endereços com list_addresses. "
+        "Para a AGENDA de contatos: list_contacts lista os contatos com nome, "
+        "telefones, e-mails e empresa (filtro opcional por nome/empresa); "
+        "contact_phones dá os telefones e e-mails de uma pessoa pelo nome; "
+        "search_contact resolve o destinatário de um e-mail pelo nome. "
         "Protocolo de listagem: PRIMEIRO resuma só os ASSUNTOS, um por um, na ordem "
         "recebida — a lista já vem ordenada por urgência e importância, cada e-mail "
         "marcado com urgencia alta, media ou baixa; cite a urgência dos altos. Não leia "
@@ -237,6 +241,32 @@ EMAIL_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_contacts",
+            "description": (
+                "Lista os contatos da agenda do usuário com nome, telefones, "
+                "e-mails e empresa (agenda Google + aprendidos do e-mail), com "
+                "filtro opcional. Use quando ele pedir para listar contatos, "
+                "saber quem trabalha em uma empresa, ou ver quem tem telefone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "term": {
+                        "type": "string",
+                        "description": "Filtro opcional (nome, domínio ou empresa).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Quantidade máxima (opcional; default 10).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "send_email",
             "description": (
                 "Envia um e-mail do usuário. SÓ chame após mostrar o rascunho "
@@ -387,6 +417,16 @@ def _tool_payload(name: str, arguments: str, user_id: str = "") -> dict:
             return {"fonte": "nenhuma", "total": 0, "candidatos": [],
                     "erro": res.get("erro", "não sei quem é o dono (EMAIL_SENDER ausente)")}
         return _search_contact(target, user_id)
+    elif name == "list_contacts":
+        result = contacts.list_contacts(user_id, args.get("term") or None,
+                                        int(args.get("limit") or 10))
+        if not result.get("ok"):
+            return {"erro": result.get("error", "falha ao listar contatos")}
+        data = result.get("data") or []
+        return {"total": len(data), "contatos": [
+            {"nome": c.get("nome", ""), "telefones": c.get("telefones", []),
+             "emails": c.get("emails", []), "empresa": c.get("empresa", ""),
+             "cargo": c.get("cargo", "")} for c in data]}
     elif name == "contact_phones":
         result = contacts.contact_phones(user_id, str(args.get("name") or "").strip())
         if not result.get("ok"):
