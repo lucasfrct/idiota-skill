@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 import cache
 import contacts
-import mail
+import mail  # noqa: F401  (endereços da caixa — última fonte da agenda)
 
 # Load environment variables (idempotent; never overrides real env vars)
 load_dotenv()
@@ -353,11 +353,11 @@ def resolve_recipient(target, user_id: str = "") -> dict:
 
 
 def _search_contact(name: str, user_id: str) -> dict:
-    """Agenda para envio — chat orquestra, cache é a memória, mail.py a fonte.
+    """Agenda para envio — chat orquestra; para na PRIMEIRA fonte que achar.
 
-    1) busca no cache (contacts.json); 2) no miss, consulta mail.list_contacts;
-    3) grava o resultado no cache para as próximas consultas.
-    Retorna {"fonte": "cache"|"imap"|"nenhuma", "candidatos": [{"nome","email"}]}.
+    1) cache (contacts.json); 2) agenda Google (contacts.py — CardDAV/People);
+    3) endereços da caixa (mail.py — IMAP). O que aprende, grava no cache.
+    Retorna {"fonte": "cache"|"google"|"imap"|"nenhuma", "candidatos": [...]}.
     """
     name = str(name or "").strip()
     if not name:
@@ -366,6 +366,28 @@ def _search_contact(name: str, user_id: str) -> dict:
     hits = cache.search_contacts(user_id, name)
     if hits:
         return {"fonte": "cache", "total": len(hits), "candidatos": hits}
+
+    # 2) agenda Google (contacts.py — CardDAV/People): só candidatos COM e-mail
+    try:
+        g = contacts.list_contacts(user_id, name, limit=5)
+        if g.get("ok"):
+            google_hits = [{"nome": c.get("nome", "") or c["emails"][0],
+                            "email": c["emails"][0],
+                            "telefones": c.get("telefones", [])}
+                           for c in (g.get("data") or []) if c.get("emails")]
+            if google_hits:
+                merged = list(cache.load_contacts(user_id))
+                known = {c.get("email", "").lower() for c in merged}
+                for c in google_hits:
+                    if c["email"].lower() not in known:
+                        merged.append({"nome": c["nome"], "email": c["email"]})
+                cache.save_contacts(user_id, merged)
+                return {"fonte": "google", "total": len(google_hits),
+                        "candidatos": google_hits}
+    except Exception as e:
+        logger.warning(f"agenda Google indisponível na busca (segue para mail): {e}")
+
+    # 3) endereços da caixa (mail.py — IMAP), última fonte
     result = mail.list_contacts(term=name, limit=10)
     if not result.get("ok"):
         return {"fonte": "nenhuma", "total": 0, "candidatos": [],
