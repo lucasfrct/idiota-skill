@@ -412,17 +412,48 @@ def generate_email(message):
         return None
 
 
+def generate_subject(body) -> str:
+    """Gera o título (assunto) a partir do CORPO do e-mail via GPT.
+
+    Título curto (máx. 8 palavras), pronto para voz. Fallback local:
+    suggest_subject (heurística) se o GPT falhar ou vier vazio. Nunca lança.
+    """
+    body = str(body or "").strip()
+    if not body:
+        return ""
+    try:
+        client = client_gpt()
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "Você gera o ASSUNTO de um e-mail a partir do corpo. Responda "
+                    "com o título e nada além dele: curto, no máximo 8 palavras, "
+                    "em português, sem markdown, sem aspas e sem ponto final.")},
+                {"role": "user", "content": f"CORPO:\n{body[:4000]}"},
+            ],
+            max_completion_tokens=64,
+            reasoning_effort="none",
+        )
+        subject = sanitize_for_tts(response.choices[0].message.content or "").strip()
+        subject = subject.strip('"').rstrip(".").strip()
+        return subject or mail.suggest_subject(body)
+    except Exception as e:
+        logger.error(f"generate_subject failed: {e}")
+        return mail.suggest_subject(body)
+
+
 def send_composed_email(message, from_email=None, to_email=None):
     """Gera o e-mail a partir da mensagem falada e envia via mail.py.
 
-    Título vem do GPT; se faltar, é sugerido do corpo no fim do fluxo.
+    Título gerado do CORPO (GPT; fallback heurístico) quando não falado.
     Retorna o envelope do mail.py: {"ok", "data"/"error"}.
     """
     draft = generate_email(message)
     if not draft:
         draft = {"subject": "", "body": str(message or "").strip()}
     if not draft["subject"]:
-        draft["subject"] = mail.suggest_subject(draft["body"])
+        draft["subject"] = generate_subject(draft["body"])
     if not draft["body"]:
         return {"ok": False, "error": "Mensagem vazia: nada para enviar"}
     return mail.send_email(subject=draft["subject"], body=draft["body"],
@@ -507,13 +538,17 @@ def dictation_clear(user_id: str) -> bool:
 def dictation_synthesize(user_id: str):
     """Une todas as anotações e sintetiza (GPT) o e-mail pronto p/ confirmar.
 
-    O rascunho permanece no cache até o envio — rejeitar a síntese não perde
-    as anotações. Retorna {"subject", "body"} ou None (nunca lança).
+    Título ausente é gerado do corpo (GPT; fallback heurístico). O rascunho
+    permanece no cache até o envio — rejeitar a síntese não perde as anotações.
+    Retorna {"subject", "body"} ou None (nunca lança).
     """
     full = dictation_text(user_id)
     if not full:
         return None
-    return generate_email(full)
+    draft = generate_email(full)
+    if draft and not str(draft.get("subject") or "").strip():
+        draft["subject"] = generate_subject(draft.get("body", ""))
+    return draft
 
 
 CONVERSATION_REPLY_MAX = int(os.getenv("CONVERSATION_REPLY_MAX", "500"))

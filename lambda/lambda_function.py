@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from chat import generate_gpt_response
 import chat
 import cache
-from mail import send_email, suggest_subject
+from mail import send_email
 
 # Load environment variables
 load_dotenv()
@@ -136,7 +136,7 @@ def ask_email_confirmation(handler_input, subject, body):
     """
     subject = str(subject or "").strip()
     if not subject:
-        subject = suggest_subject(body)
+        subject = chat.generate_subject(body)
     handler_input.attributes_manager.session_attributes["email_flow"] = {
         "subject": subject,
         "body": body,
@@ -182,8 +182,8 @@ def send_pending_email(handler_input):
         logger.error("Email flow attempted without EMAIL_SENDER/EMAIL_RECIPIENT")
         return "O envio de e-mail não está configurado no ambiente."
 
-    # Título é exigência do send_email: fallback de sugestão (corpo já conhecido)
-    subject = str(flow.get("subject") or "").strip() or suggest_subject(flow.get("body", ""))
+    # Título é exigência do send_email: gerado do corpo (GPT; fallback heurístico)
+    subject = str(flow.get("subject") or "").strip() or chat.generate_subject(flow.get("body", ""))
     result = send_email(subject=subject, body=flow.get("body", ""),
                         from_email=EMAIL_SENDER, to_email=EMAIL_RECIPIENT)
     logger.info(f"Email attempt result: {result}")
