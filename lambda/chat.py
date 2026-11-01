@@ -7,6 +7,7 @@ import json
 import os
 import re
 import logging
+from datetime import datetime, timedelta, timezone
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -462,7 +463,100 @@ def dictation_synthesize(user_id: str):
     return generate_email(full)
 
 
-def generate_gpt_response(history: list, query) -> str:
+# ---------------------------------------------------------------------------
+# Memória de longo prazo: notas explícitas + busca/recall de turnos antigos
+# ---------------------------------------------------------------------------
+
+def _now() -> str:
+    """Timestamp ISO (microssegundos) — anexado a cada turno no histórico."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def annotate(user_id: str, text: str) -> bool:
+    """Salva uma nota explícita ("anote que ...") na memória persistente."""
+    return cache.save_note(user_id, text)
+
+
+def _date_window(low: str):
+    """Janela [since, until) ISO derivada de palavras de data na pergunta."""
+    day0 = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    if "anteontem" in low:
+        return ((day0 - timedelta(days=2)).isoformat(), (day0 - timedelta(days=1)).isoformat())
+    if "ontem" in low:
+        return ((day0 - timedelta(days=1)).isoformat(), day0.isoformat())
+    if "hoje" in low:
+        return (day0.isoformat(), (day0 + timedelta(days=1)).isoformat())
+    return None, None
+
+
+def summarize_turns(turns: list, question: str) -> str:
+    """Recebe turnos [{role, content, at}] + a pergunta e produz um INSUMO
+    objetivo (fatos, decisões, datas, nomes) para responder à pergunta.
+    Retorna 'NADA RELEVANTE' quando o histórico não ajuda. Nunca lança."""
+    if not turns:
+        return "NADA RELEVANTE"
+    lines = [
+        f"- ({(t.get('at') or 'sem data')[:16]}) {t.get('role', 'user')}: "
+        f"{str(t.get('content', ''))[:400]}"
+        for t in turns[:150]
+    ]
+    prompt = (
+        "Você resume histórico de conversa para responder uma pergunta. "
+        "Abaixo, a pergunta e os turnos anteriores (com data). Produza um INSUMO "
+        "objetivo em português: fatos, decisões, datas e nomes que ajudem a "
+        "responder; ignore o irrelevante; não invente nada. Se nada for "
+        "relevante, escreva exatamente: NADA RELEVANTE.\n\n"
+        f"PERGUNTA: {question}\n\nTURNOS:\n" + "\n".join(lines)
+    )
+    try:
+        client = client_gpt()
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=max(MAX_TOKENS, 500),
+            reasoning_effort="none",
+        )
+        summary = (response.choices[0].message.content or "").strip()
+        return summary or "NADA RELEVANTE"
+    except Exception as e:
+        logger.error(f"summarize_turns failed: {e}")
+        return "NADA RELEVANTE"
+
+
+def answer_from_memory(user_id: str, question: str) -> str:
+    """Recall: busca turnos + notas (com janela de data da pergunta), resume e
+    responde. Degrada para o insumo bruto se a 2ª chamada falhar. Nunca lança."""
+    since, until = _date_window(question.lower())
+    turns = cache.search_turns(user_id, since=since, until=until, limit=200)
+    notes = cache.search_notes(user_id, since=since, until=until, limit=100)
+    if not turns and not notes:
+        return "Não encontrei nada na memória sobre isso."
+    items = ([{"role": t["role"], "content": t["content"], "at": t["at"]} for t in turns]
+             + [{"role": "nota", "content": n["text"], "at": n["at"]} for n in notes])
+    insumo = summarize_turns(items, question)
+    if "NADA RELEVANTE" in insumo.upper():
+        return "Não encontrei nada relevante na memória sobre isso."
+    try:
+        client = client_gpt()
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                system_instructions(),
+                {"role": "user", "content": (
+                    "Responda em voz, curto, usando APENAS o insumo abaixo "
+                    "(memória de conversas anteriores do usuário).\n\n"
+                    f"INSUMO: {insumo}\n\nPERGUNTA: {question}")},
+            ],
+            max_completion_tokens=MAX_TOKENS,
+            reasoning_effort="none",
+        )
+        return sanitize_for_tts(response.choices[0].message.content or insumo)
+    except Exception as e:
+        logger.error(f"answer_from_memory final failed: {e}")
+        return sanitize_for_tts(insumo)
+
+
+def generate_gpt_response(history: list, query, user_id: str = "") -> str:
     """Generate a voice-friendly GPT response with bounded session history.
 
     `history` é a lista de mensagens da sessão (mutada in place pelo chat);
@@ -470,9 +564,39 @@ def generate_gpt_response(history: list, query) -> str:
     Perguntas sobre e-mail disparam ferramentas (mail.py): a troca de tool
     calls vive em mensagens locais — só o turno user/assistant entra na
     memória persistida (replay de tool messages quebraria a API).
+
+    Memória de longo prazo (precisa de user_id): "anote/anota/lembre que X"
+    salva nota persistente; "o que conversamos/anotamos..." e "lembra ..."
+    buscam turnos/notas (com janela de data: ontem/hoje/anteontem) e respondem
+    via insumo (summarize_turns). Turnos ganham timestamp "at"; a API do GPT
+    recebe só {role, content}.
     """
     if not query or not query.strip():
         return "Desculpe, não recebi sua pergunta."
+
+    q = str(query).strip()
+    low = q.lower()
+
+    m_note = re.match(r"^\s*(?:anote|anota|lembre)\b\s*(?:que\s+|de\s+|:)?\s*(.+)", q, re.I | re.S)
+    m_recall = (re.search(r"\b(?:o que|quais?|quando|quem)\b.{0,80}?\b"
+                          r"(?:conversamos|falamos|anotamos|anotei|combinamos)\b", low)
+                or re.match(r"^\s*lembra\b", low))
+
+    if user_id and m_note:
+        note = m_note.group(1).strip()
+        ok_note = cache.save_note(user_id, note)
+        reply = "Anotado." if ok_note else "Não consegui salvar a anotação."
+        history.append({"role": "user", "content": q, "at": _now()})
+        history.append({"role": "assistant", "content": reply, "at": _now()})
+        del history[:-MAX_HISTORY]
+        return reply
+
+    if user_id and m_recall:
+        reply = answer_from_memory(user_id, q)
+        history.append({"role": "user", "content": q, "at": _now()})
+        history.append({"role": "assistant", "content": reply, "at": _now()})
+        del history[:-MAX_HISTORY]
+        return reply
 
     try:
         client = client_gpt()
@@ -481,8 +605,12 @@ def generate_gpt_response(history: list, query) -> str:
         return "Erro de configuração. Verifique a chave da API no ambiente."
 
     try:
-        history.append({"role": "user", "content": query.strip()})
-        messages = [system_instructions()] + history[-MAX_HISTORY:]
+        history.append({"role": "user", "content": q, "at": _now()})
+        # A API aceita apenas {role, content} — timestamps ficam no histórico local.
+        messages = [system_instructions()] + [
+            {"role": m.get("role", "user"), "content": m.get("content", "")}
+            for m in history[-MAX_HISTORY:]
+        ]
 
         response = client.chat.completions.create(
             model=MODEL,
@@ -514,7 +642,7 @@ def generate_gpt_response(history: list, query) -> str:
             message = response.choices[0].message
 
         reply = sanitize_for_tts(message.content or "")
-        history.append({"role": "assistant", "content": reply})
+        history.append({"role": "assistant", "content": reply, "at": _now()})
         del history[:-MAX_HISTORY]
         return reply
 

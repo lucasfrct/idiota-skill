@@ -19,13 +19,18 @@ Mecânica:
   a skill; em falha retorna valor seguro (default / False / lista vazia).
 
 Coleções:
-- chats.json     — memória de turnos por usuário {user_id: {"history", "updated"}}
-- emails.json    — {"registry" (e-mails disponíveis), "sent" (enviados),
-                   "errors" (falhas), "seq"} com metadados (para, assunto,
-                   mensagem, data, resultado).
+- chats.json      — memória de turnos por usuário
+                   {user_id: {"history", "stamps", "updated"}}; history são
+                   mensagens {"role", "content"(, "at")}; stamps é o array
+                   paralelo de timestamps (um por turno) para busca por data.
+- emails.json     — {"registry" (e-mails disponíveis), "sent" (enviados),
+                    "errors" (falhas), "seq"} com metadados (para, assunto,
+                    mensagem, data, resultado).
 - dictations.json — rascunho de ditado longo por usuário
-                   {user_id: {"chunks", "updated"}} — anotações acumuladas
-                   entre turnos/sessões até "pronto" sintetizar e enviar.
+                    {user_id: {"chunks", "updated"}} — anotações acumuladas
+                    entre turnos/sessões até "pronto" sintetizar e enviar.
+- notes.json      — notas explícitas ("anote que ...") por usuário
+                    {user_id: {"notes": [{"text", "at"}], "updated"}}.
 """
 import json
 import logging
@@ -39,18 +44,20 @@ logger = logging.getLogger(__name__)
 
 # Configuration (environment-driven)
 CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/idiota-cache")
-MAX_CHAT_TURNS = int(os.getenv("CACHE_MAX_CHAT_TURNS", "40"))
+MAX_CHAT_TURNS = int(os.getenv("CACHE_MAX_CHAT_TURNS", "300"))
 MAX_USERS = int(os.getenv("CACHE_MAX_USERS", "50"))
 MAX_SENT = int(os.getenv("CACHE_MAX_SENT", "500"))
 MAX_ERRORS = int(os.getenv("CACHE_MAX_ERRORS", "200"))
 MAX_EMAILS = int(os.getenv("CACHE_MAX_EMAILS", "200"))
 MAX_DICTATION_CHUNKS = int(os.getenv("CACHE_MAX_DICTATION_CHUNKS", "200"))
+MAX_NOTES = int(os.getenv("CACHE_MAX_NOTES", "500"))
 BODY_MAX = int(os.getenv("CACHE_BODY_MAX", "2000"))
 TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "7"))  # 0 desativa a expiração
 
 CHATS = "chats"
 EMAILS = "emails"
 DICTATIONS = "dictations"
+NOTES = "notes"
 
 _lock = threading.RLock()
 _mirror = {}   # name -> {"mtime_ns": int, "data": ...}
@@ -184,6 +191,8 @@ def save_chat(user_id: str, history: list) -> bool:
         if not user_id:
             return False
         turns = list(history or [])[-max(1, MAX_CHAT_TURNS):]
+        # Stamp por turno: usa o "at" da própria mensagem (estável entre saves);
+        # turnos antigos sem stamp ficam "" (busca por data os ignora, sem apagar).
 
         def fn(data):
             data = dict(data or {})
@@ -192,7 +201,8 @@ def save_chat(user_id: str, history: list) -> bool:
                 data = {k: v for k, v in data.items()
                         if k == user_id or not _expired((v or {}).get("updated"), cutoff)}
             now = _now()
-            data[user_id] = {"history": turns, "updated": now}
+            stamps = [str((m or {}).get("at", "") if isinstance(m, dict) else "") for m in turns]
+            data[user_id] = {"history": turns, "stamps": stamps, "updated": now}
             if len(data) > max(1, MAX_USERS):
                 oldest = sorted(
                     (k for k in data if k != user_id),
@@ -225,6 +235,121 @@ def clear_chat(user_id: str) -> bool:
         return update_json(CHATS, fn, default={})
     except Exception as e:
         logger.error("cache: clear_chat failed: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Frente 4 — busca em turnos antigos + notas explícitas (memória consultável)
+# ---------------------------------------------------------------------------
+
+def search_turns(user_id: str, contains=None, since=None, until=None, limit=100) -> list:
+    """Busca turnos persistidos por conteúdo e/ou janela de data.
+
+    Retorna [{"role", "content", "at"}], mais recentes primeiro. Turnos sem
+    timestamp legível são consultáveis por conteúdo (nunca excluídos por data).
+    """
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return []
+        with _lock:
+            data = read_json(CHATS, default={}) or {}
+            entry = data.get(user_id) or {}
+            history = list(entry.get("history", []))
+            stamps = list(entry.get("stamps", []))
+        turns = []
+        for i, m in enumerate(history):
+            content = m.get("content", "") if isinstance(m, dict) else str(m)
+            role = m.get("role", "user") if isinstance(m, dict) else "user"
+            at = str((m or {}).get("at", "") if isinstance(m, dict) else "")
+            if not at and i < len(stamps):
+                at = str(stamps[i] or "")
+            turns.append({"role": role, "content": content, "at": at})
+        cutoff = _cutoff()
+        if cutoff:
+            turns = [t for t in turns if not t["at"] or not _expired(t["at"], cutoff)]
+        if since:
+            turns = [t for t in turns if t["at"] and t["at"] >= since]
+        if until:
+            turns = [t for t in turns if t["at"] and t["at"] < until]
+        if contains:
+            needle = str(contains).strip().lower()
+            turns = [t for t in turns if needle in t["content"].lower()]
+        return list(reversed(turns[-max(1, int(limit)):]))  # mais recentes primeiro
+    except Exception as e:
+        logger.error("cache: search_turns failed: %s", e)
+        return []
+
+
+def save_note(user_id: str, text: str) -> bool:
+    """Persiste uma nota explícita do usuário ("anote que ...")."""
+    try:
+        user_id = str(user_id or "").strip()
+        text = str(text or "").strip()
+        if not user_id or not text:
+            return False
+
+        def fn(data):
+            data = dict(data or {})
+            cutoff = _cutoff()
+            if cutoff:
+                data = {k: v for k, v in data.items()
+                        if k == user_id or not _expired((v or {}).get("updated"), cutoff)}
+            now = _now()
+            entry = data.get(user_id) or {"notes": [], "updated": ""}
+            notes = list(entry.get("notes", []))
+            notes.append({"text": text[:2000], "at": now})
+            data[user_id] = {"notes": notes[-max(1, MAX_NOTES):], "updated": now}
+            return data
+
+        return update_json(NOTES, fn, default={})
+    except Exception as e:
+        logger.error("cache: save_note failed: %s", e)
+        return False
+
+
+def search_notes(user_id: str, contains=None, since=None, until=None, limit=50) -> list:
+    """Busca notas do usuário por conteúdo e/ou janela de data (recentes 1º)."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return []
+        with _lock:
+            data = read_json(NOTES, default={}) or {}
+            notes = list((data.get(user_id) or {}).get("notes", []))
+        cutoff = _cutoff()
+        if cutoff:
+            notes = [n for n in notes if not _expired(n.get("at"), cutoff)]
+        if since:
+            notes = [n for n in notes if str(n.get("at", "")) >= since]
+        if until:
+            notes = [n for n in notes if str(n.get("at", "")) < until]
+        if contains:
+            needle = str(contains).strip().lower()
+            notes = [n for n in notes if needle in str(n.get("text", "")).lower()]
+        return [dict(n) for n in reversed(notes[-max(1, int(limit)):])]
+    except Exception as e:
+        logger.error("cache: search_notes failed: %s", e)
+        return []
+
+
+def clear_notes(user_id: str) -> bool:
+    """Drop all notes for a user."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return False
+
+        def fn(data):
+            data = dict(data or {})
+            if user_id not in data:
+                return None
+            data.pop(user_id, None)
+            return data
+
+        return update_json(NOTES, fn, default={})
+    except Exception as e:
+        logger.error("cache: clear_notes failed: %s", e)
         return False
 
 

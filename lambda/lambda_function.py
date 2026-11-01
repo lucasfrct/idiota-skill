@@ -261,9 +261,10 @@ class GptQueryIntentHandler(AbstractRequestHandler):
                 )
 
             history = get_history(handler_input)
-            speak_output = generate_gpt_response(history, query)
+            uid = user_id(handler_input)
+            speak_output = generate_gpt_response(history, query, user_id=uid)
             # Persiste a memória de turnos do usuário no cache local
-            chat.save_history(user_id(handler_input), history)
+            chat.save_history(uid, history)
 
         except Exception as e:
             logger.error(f"Error in GptQueryIntentHandler: {e}")
