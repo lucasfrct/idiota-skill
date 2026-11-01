@@ -45,12 +45,16 @@ def system_instructions():
         "Responda em Português do Brasil, de forma direta e curta: no máximo 2 ou 3 frases, "
         "exceto ao listar e-mails, quando você cita cada um resumidamente. "
         "Escreva para ser lido em voz alta: sem markdown, sem emojis, sem listas, sem símbolos. "
-        "Você se lembra das últimas mensagens da conversa e tem ferramenta de e-mail: "
-        "quando o usuário pedir para ver, listar ou procurar e-mails, chame list_emails "
-        "ou filter_emails antes de responder; para perguntas sobre QUEM mandou e-mails "
-        "ou sobre endereços/contatos, chame list_addresses; para LER um e-mail "
-        "específico escolhido por remetente, assunto/título ou data (hoje, ontem, "
-        "AAAA-MM-DD, DD/MM/AAAA), chame read_email e conte o conteúdo fielmente. "
+        "Para qualquer pergunta que NÃO envolva e-mail, responda direto com seu próprio conhecimento. "
+        "Se o pedido envolver e-mail, use as ferramentas antes de responder: "
+        "list_emails para mostrar a caixa de entrada com conteúdo; "
+        "filter_emails para buscar por nome, domínio, assunto ou data (hoje, ontem, anteontem, "
+        "AAAA-MM-DD ou DD/MM/AAAA); "
+        "read_email para ler um e-mail inteiro — informe o uid da listagem ou a posição "
+        "(1 é o mais recente); quando o usuário disser o N-ésimo e-mail, use a posição. "
+        "Para enviar, monte o rascunho com assunto e corpo, mostre ao usuário e SÓ chame "
+        "send_email depois de confirmação clara; se faltar destinatário, pergunte antes. "
+        "Você também pode listar endereços com list_addresses. "
         "Ao listar, cite remetente, "
         "assunto e resuma o conteúdo de cada e-mail, do mais recente para o mais antigo, "
         "sem inventar e-mails. "
@@ -86,18 +90,23 @@ EMAIL_TOOLS = [
         "function": {
             "name": "filter_emails",
             "description": (
-                "Filtra os e-mails recentes por um termo no remetente ou no assunto. "
-                "Use quando o usuário pedir e-mails de alguém ou sobre algo."
+                "Busca e-mails recentes por nome/domínio (remetente), assunto e/ou "
+                "data (hoje, ontem, anteontem, AAAA-MM-DD ou DD/MM/AAAA). Use quando "
+                "o usuário pedir e-mails de alguém, sobre algo ou de um dia."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "term": {
                         "type": "string",
-                        "description": "Termo a buscar (nome, domínio ou assunto).",
+                        "description": "Termo no remetente ou assunto (nome, domínio, palavra).",
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Data dos e-mails: hoje, ontem, anteontem, AAAA-MM-DD ou DD/MM/AAAA.",
                     },
                 },
-                "required": ["term"],
+                "required": [],
             },
         },
     },
@@ -128,14 +137,22 @@ EMAIL_TOOLS = [
         "function": {
             "name": "read_email",
             "description": (
-                "Lê um e-mail ESPECÍFICO por completo, com o corpo inteiro. Use "
-                "quando o usuário quiser LER um e-mail que escolheu por remetente, "
-                "por assunto/título ou por data (hoje, ontem, AAAA-MM-DD ou "
-                "DD/MM/AAAA). Combine critérios para achar o e-mail certo."
+                "Lê um e-mail ESPECÍFICO por completo, com o corpo inteiro. Escolha o "
+                "e-mail por uid (da listagem), por posição na caixa de entrada "
+                "(position: 1 é o mais recente — use para o N-ésimo e-mail) ou por "
+                "remetente, assunto e/ou data. Combine critérios para achar o certo."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "UID do e-mail retornado por list_emails.",
+                    },
+                    "position": {
+                        "type": "integer",
+                        "description": "Posição na caixa de entrada, 1 = mais recente (ex.: o segundo e-mail = 2).",
+                    },
                     "sender": {
                         "type": "string",
                         "description": "Remetente: nome, endereço ou domínio.",
@@ -154,6 +171,34 @@ EMAIL_TOOLS = [
                     },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": (
+                "Envia um e-mail do usuário. SÓ chame após mostrar o rascunho "
+                "(destinatário, assunto e corpo) e receber confirmação clara."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "Destinatário (endereço completo). Se ausente, usa o destinatário padrão.",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Assunto/título do e-mail.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Corpo da mensagem (texto do e-mail).",
+                    },
+                },
+                "required": ["subject", "body"],
             },
         },
     },
@@ -181,7 +226,11 @@ def _tool_payload(name: str, arguments: str) -> dict:
     if name == "list_emails":
         result = mail.list_emails(args.get("limit") or EMAIL_LIST_LIMIT, with_body=True)
     elif name == "filter_emails":
-        result = mail.filter_emails(args.get("term", ""), EMAIL_LIST_LIMIT)
+        if str(args.get("date") or "").strip():
+            result = mail.find_email(term=(args.get("term") or "").strip() or None,
+                                     date=args.get("date"), limit=EMAIL_LIST_LIMIT)
+        else:
+            result = mail.filter_emails(args.get("term", ""), EMAIL_LIST_LIMIT)
     elif name == "list_addresses":
         result = mail.list_addresses(args.get("term") or None, EMAIL_LIST_LIMIT)
         if not result.get("ok"):
@@ -189,6 +238,28 @@ def _tool_payload(name: str, arguments: str) -> dict:
         addresses = result.get("data") or []
         return {"total": len(addresses), "enderecos": addresses}
     elif name == "read_email":
+        uid = str(args.get("uid") or "").strip()
+        position = args.get("position")
+        if not uid and position:
+            try:
+                pos = max(1, int(position))
+            except (TypeError, ValueError):
+                return {"erro": "posição inválida: informe um número a partir de 1"}
+            listing = mail.list_emails(pos, with_body=False)
+            if not listing.get("ok"):
+                return {"erro": listing.get("error", "falha ao localizar o e-mail")}
+            data = listing.get("data") or []
+            if pos > len(data):
+                return {"erro": f"só encontrei {len(data)} e-mails; não existe posição {pos}"}
+            uid = data[pos - 1].get("uid", "")
+        if uid:
+            result = mail.read_email(uid)
+            if not result.get("ok"):
+                return {"erro": result.get("error", "falha ao ler o e-mail")}
+            m = result.get("data") or {}
+            return {"uid": m.get("uid", uid), "remetente": m.get("from", ""),
+                    "assunto": m.get("subject", ""), "data": m.get("date", ""),
+                    "corpo_completo": _snippet(m.get("body", ""), 1500)}
         result = mail.find_email(term=args.get("term"), sender=args.get("sender"),
                                  subject=args.get("subject"), date=args.get("date"),
                                  limit=3)
@@ -196,11 +267,22 @@ def _tool_payload(name: str, arguments: str) -> dict:
             return {"erro": result.get("error", "falha ao ler o e-mail")}
         found = result.get("data") or []
         return {"total": len(found), "emails": [{
+            "uid": m.get("uid", ""),
             "remetente": m.get("from", ""),
             "assunto": m.get("subject", ""),
             "data": m.get("date", ""),
             "corpo_completo": _snippet(m.get("body", ""), 1500),
         } for m in found]}
+    elif name == "send_email":
+        subject = str(args.get("subject") or "").strip()
+        body = str(args.get("body") or "").strip()
+        to = str(args.get("to") or "").strip() or None
+        if not subject or not body:
+            return {"erro": "assunto e corpo são obrigatórios para enviar o e-mail"}
+        result = mail.send_email(subject=subject, body=body, to_email=to)
+        if not result.get("ok"):
+            return {"erro": result.get("error", "falha ao enviar o e-mail")}
+        return {"enviado": True, "mensagem": str(result.get("data", ""))}
     else:
         return {"erro": f"ferramenta desconhecida: {name}"}
     if not result.get("ok"):
