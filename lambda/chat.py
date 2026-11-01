@@ -56,7 +56,8 @@ def system_instructions():
         "read_email para ler um e-mail inteiro — informe o uid da listagem ou a posição "
         "(1 é o mais recente); quando o usuário disser o N-ésimo e-mail, use a posição. "
         "Para enviar, se o usuário indicar a pessoa pelo nome, chame search_contact: "
-        "a busca é parcial e sem acentos — 'cris' acha Cristina, 'rafa' acha Rafael; "
+        "a busca é PARCIAL e sem acentos — 'rafa' acha Rafael e Rafaela, 'cris' acha "
+        "Cristiane, 'leo' acha os Leonardos, mesmo com o apelido no meio do nome; "
         "com um só candidato, confirme e envie; com vários, mostre as opções e pergunte "
         "qual usar; sem candidato, peça o endereço. Se o usuário disser 'para mim', "
         "'pra mim' ou 'eu mesmo', o destinatário é o PRÓPRIO dono da skill (o mesmo "
@@ -223,8 +224,10 @@ EMAIL_TOOLS = [
             "description": (
                 "Busca na agenda os TELEFONES e e-mails de uma pessoa pelo nome "
                 "(agenda Google do usuário, quando configurada, + contatos "
-                "aprendidos do e-mail). Use quando ele pedir telefone/contato "
-                "de alguém ou para enviar SMS/mensagem."
+                "aprendidos do e-mail). Busca PARCIAL: 'rafa' acha Rafael e "
+                "Rafaela, 'cris' acha Cristiane, 'leo' acha os Leonardos. Com "
+                "vários candidatos, o resultado traz a lista — mostre as opções "
+                "e pergunte qual o usuário quer."
             ),
             "parameters": {
                 "type": "object",
@@ -432,9 +435,14 @@ def _tool_payload(name: str, arguments: str, user_id: str = "") -> dict:
         if not result.get("ok"):
             return {"erro": result.get("error", "contato não encontrado")}
         d = result.get("data") or {}
-        return {"nome": d.get("nome", ""), "telefones": d.get("telefones", []),
-                "emails": d.get("emails", []), "empresa": d.get("empresa", ""),
-                "fonte": d.get("fonte", "")}
+        payload = {"multi": d.get("multi", False), "nome": d.get("nome", ""),
+                   "telefones": d.get("telefones", []), "emails": d.get("emails", []),
+                   "empresa": d.get("empresa", ""), "fonte": d.get("fonte", "")}
+        if d.get("multi"):
+            payload["candidates"] = d.get("candidates", [])
+            payload["instrucao"] = ("vários candidatos — liste NOME + TELEFONE de cada "
+                                    "um e pergunte qual o usuário quer")
+        return payload
     elif name == "read_email":
         uid = str(args.get("uid") or "").strip()
         position = args.get("position")

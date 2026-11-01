@@ -252,18 +252,22 @@ def list_contacts(user_id: str, term=None, limit=50):
                           else carddav_contacts(limit=fetch_n))
                 hay_needle = needle.lower()
                 seen = {i["email"].lower() for i in items if i.get("email")}
+                seen_names = {i["nome"].lower() for i in items if i.get("nome")}
                 for c in google:
                     if len(items) >= limit:
                         break
                     emails = c.get("emails", [])
                     key = emails[0].lower() if emails else c.get("nome", "").lower()
-                    if not key or key in seen:
+                    nome_low = c.get("nome", "").lower()
+                    if not key or key in seen or (nome_low and nome_low in seen_names):
                         continue
                     if needle and needle.lower() not in (
                             c.get("nome", "") + " " + " ".join(emails) + " "
                             + c.get("empresa", "") + " " + c.get("cargo", "")).lower():
                         continue
                     seen.add(key)
+                    if nome_low:
+                        seen_names.add(nome_low)
                     items.append({"nome": c.get("nome", ""), "email": emails[0] if emails else "",
                                   "telefones": c.get("telefones", []), "emails": emails,
                                   "empresa": c.get("empresa", ""), "cargo": c.get("cargo", ""),
@@ -279,7 +283,12 @@ def list_contacts(user_id: str, term=None, limit=50):
 
 
 def contact_phones(user_id: str, name: str):
-    """Telefones + e-mails de um contato pelo nome (cache → Google). Envelope."""
+    """Telefones + e-mails de um contato pelo nome (cache → Google).
+
+    Busca PARCIAL: 'rafa' acha Rafael/Rafaela, 'cris' acha Cristiane, 'leo'
+    acha os Leonardos. Com VÁRIOS candidatos não escolhe sozinho — retorna
+    {"multi": True, "candidates": [...]} para o chat listar e perguntar.
+    """
     if not name or not str(name).strip():
         return _err("Informe o nome do contato")
     result = list_contacts(user_id, name, limit=5)
@@ -288,8 +297,15 @@ def contact_phones(user_id: str, name: str):
     items = result.get("data", [])
     if not items:
         return _err(f"Contato '{name}' não encontrado na agenda")
+    if len(items) > 1:
+        return _ok({"multi": True, "nome": str(name).strip(),
+                    "candidates": [{"nome": i.get("nome", ""),
+                                    "telefones": i.get("telefones", []),
+                                    "emails": i.get("emails", []) or ([i["email"]] if i.get("email") else []),
+                                    "empresa": i.get("empresa", "")} for i in items]})
     best = items[0]
     return _ok({
+        "multi": False,
         "nome": best.get("nome", ""),
         "telefones": best.get("telefones", []),
         "emails": best.get("emails", []) or ([best["email"]] if best.get("email") else []),
