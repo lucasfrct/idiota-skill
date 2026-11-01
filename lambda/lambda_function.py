@@ -128,7 +128,69 @@ def clear_email_flow(handler_input):
     handler_input.attributes_manager.session_attributes.pop("email_flow", None)
 
 
-def ask_email_confirmation(handler_input, subject, body):
+def parse_recipient(message) -> str:
+    """Extrai o destino falado depois de 'para' (mim, nome ou endereço), se houver.
+
+    'envie para cris assunto X mensagem Y' -> 'cris'; 'para mim ...' -> 'mim';
+    sem 'para' -> '' (fluxo usa o destinatário padrão). Tolera artigos
+    ('para a cris', '...ex.com o texto') e pontuação de fala.
+    """
+    m = re.search(
+        r"\bpara\s+(?:o\s+|a\s+)?(?P<to>[^,]+?)(?=\s*,?\s*\b(?:o|a|os|as)?\b\s*"
+        r"(?:assunto|mensagem|texto|dizendo)\b|\s*$)",
+        str(message or ""),
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return ""
+    to = m.group("to").strip(" .!?")
+    to = re.sub(r"\s+(?:o|a|os|as)$", "", to, flags=re.IGNORECASE).strip()
+    return to
+
+
+def confirm_email_flow(handler_input, subject, body, target):
+    """Resolve o destinatário dito ('para mim', nome ou endereço) e segue para
+    a confirmação — ou explica o impedimento sem criar e-mail pendente.
+
+    'mim'/endereço/nome único -> confirma falando o destino resolvido; vários
+    candidatos -> lista e pede para repetir com nome mais específico; nenhum ->
+    pede endereço ou 'para mim'; sem destino dito -> destinatário padrão.
+    """
+    res = chat.resolve_recipient(target, user_id(handler_input)) if str(target or "").strip() \
+        else {"tipo": "vazio"}
+    kind = res.get("tipo")
+    if kind in ("unico", "mim", "endereco"):
+        return ask_email_confirmation(handler_input, subject, body,
+                                      to_email=res["email"],
+                                      to_nome=str(res.get("nome") or ""))
+    if kind == "varios":
+        names = ", ".join(str(c.get("nome") or c.get("email") or "?")
+                          for c in res.get("candidatos", []))
+        speak_output = (f"Achei mais de um para {target}: {names}. "
+                        f"Repita dizendo o nome mais completo de quem escolheu.")
+        return (
+            handler_input.response_builder.speak(speak_output)
+            .ask(f"Diga por exemplo: para {res.get('candidatos', [{}])[0].get('nome', '')}")
+            .response
+        )
+    if kind == "nenhum":
+        speak_output = (f"Não achei {target} na agenda. Diga o endereço completo, "
+                        f"diga 'para mim', ou repita sem destino para usar o padrão.")
+        return (
+            handler_input.response_builder.speak(speak_output)
+            .ask("Como quer o destinatário?")
+            .response
+        )
+    if kind == "erro":
+        return (
+            handler_input.response_builder.speak(res.get("erro", "Não sei o destinatário."))
+            .ask(ASK_REPROMPT)
+            .response
+        )
+    return ask_email_confirmation(handler_input, subject, body)
+
+
+def ask_email_confirmation(handler_input, subject, body, to_email=None, to_nome=""):
     """Store the pending email and ask the user to confirm.
 
     Título exigido no envio: se o usuário não disse um, sugere do corpo aqui —
@@ -137,12 +199,17 @@ def ask_email_confirmation(handler_input, subject, body):
     subject = str(subject or "").strip()
     if not subject:
         subject = chat.generate_subject(body)
+    to_email = str(to_email or EMAIL_RECIPIENT or "").strip()
+    to_nome = str(to_nome or "").strip()
     handler_input.attributes_manager.session_attributes["email_flow"] = {
         "subject": subject,
         "body": body,
+        "to": to_email,
+        "to_nome": to_nome,
     }
+    who = to_nome if to_nome else spoken_email(to_email)
     speak_output = (
-        f"Vou enviar um e-mail para {spoken_email(EMAIL_RECIPIENT)}, "
+        f"Vou enviar um e-mail para {who}, "
         f"com o assunto {subject} e a mensagem: {body}. Confirma?"
     )
     return (
@@ -178,21 +245,22 @@ def send_pending_email(handler_input):
     if not flow or "body" not in flow:
         return "Não há e-mail pendente para enviar."
 
-    if not EMAIL_SENDER or not EMAIL_RECIPIENT:
-        logger.error("Email flow attempted without EMAIL_SENDER/EMAIL_RECIPIENT")
+    to_email = str(flow.get("to") or EMAIL_RECIPIENT or "").strip()
+    if not EMAIL_SENDER or not to_email:
+        logger.error("Email flow attempted without EMAIL_SENDER/destinatário")
         return "O envio de e-mail não está configurado no ambiente."
 
     # Título é exigência do send_email: gerado do corpo (GPT; fallback heurístico)
     subject = str(flow.get("subject") or "").strip() or chat.generate_subject(flow.get("body", ""))
     result = send_email(subject=subject, body=flow.get("body", ""),
-                        from_email=EMAIL_SENDER, to_email=EMAIL_RECIPIENT)
+                        from_email=EMAIL_SENDER, to_email=to_email)
     logger.info(f"Email attempt result: {result}")
 
     # Frente 2 do cache: metadados do envio + lista de e-mails disponíveis
     ok = bool(result.get("ok")) if isinstance(result, dict) else False
     info = (result.get("data") or result.get("error") or "") if isinstance(result, dict) else str(result)
     cache.record_email(
-        to_email=EMAIL_RECIPIENT,
+        to_email=to_email,
         subject=subject,
         body=flow.get("body", ""),
         ok=ok,
@@ -205,7 +273,7 @@ def send_pending_email(handler_input):
 
     # Fala derivada do envelope (send_email nunca lança; nunca falar dict)
     if ok:
-        return str(info) or f"E-mail enviado com sucesso para {EMAIL_RECIPIENT}."
+        return str(info) or f"E-mail enviado com sucesso para {to_email}."
     return str(info) or "Não consegui enviar o e-mail."
 
 
@@ -275,7 +343,8 @@ class GptQueryIntentHandler(AbstractRequestHandler):
                 clear_email_flow(handler_input)
                 if query:
                     subject, body = parse_subject_body(query)
-                    return ask_email_confirmation(handler_input, subject, body)
+                    return confirm_email_flow(handler_input, subject, body,
+                                              parse_recipient(query))
                 speak_output = "Não recebi a mensagem. Peça o e-mail de novo, por favor."
                 return (
                     handler_input.response_builder.speak(speak_output)
@@ -330,7 +399,7 @@ class SendEmailIntentHandler(AbstractRequestHandler):
                 return elicit_email_body(handler_input)
 
             subject, body = parse_subject_body(message)
-            return ask_email_confirmation(handler_input, subject, body)
+            return confirm_email_flow(handler_input, subject, body, parse_recipient(message))
 
         except Exception as e:
             logger.error(f"Error in SendEmailIntentHandler: {e}")

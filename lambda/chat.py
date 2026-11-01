@@ -7,12 +7,14 @@ import json
 import os
 import re
 import logging
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 from openai import OpenAI
 from dotenv import load_dotenv
 
 import cache
+import contacts
 import mail
 
 # Load environment variables (idempotent; never overrides real env vars)
@@ -54,8 +56,12 @@ def system_instructions():
         "read_email para ler um e-mail inteiro — informe o uid da listagem ou a posição "
         "(1 é o mais recente); quando o usuário disser o N-ésimo e-mail, use a posição. "
         "Para enviar, se o usuário indicar a pessoa pelo nome, chame search_contact: "
+        "a busca é parcial e sem acentos — 'cris' acha Cristina, 'rafa' acha Rafael; "
         "com um só candidato, confirme e envie; com vários, mostre as opções e pergunte "
-        "qual usar; sem candidato, peça o endereço. Monte o rascunho com assunto e corpo, "
+        "qual usar; sem candidato, peça o endereço. Se o usuário disser 'para mim', "
+        "'pra mim' ou 'eu mesmo', o destinatário é o PRÓPRIO dono da skill (o mesmo "
+        "endereço que envia e recebe) — chame search_contact com 'mim' para obter o "
+        "endereço. Monte o rascunho com assunto e corpo, "
         "mostre ao usuário e SÓ chame send_email depois de confirmação clara; "
         "se faltar destinatário, pergunte antes. "
         "Você também pode listar endereços com list_addresses. "
@@ -209,6 +215,28 @@ EMAIL_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "contact_phones",
+            "description": (
+                "Busca na agenda os TELEFONES e e-mails de uma pessoa pelo nome "
+                "(agenda Google do usuário, quando configurada, + contatos "
+                "aprendidos do e-mail). Use quando ele pedir telefone/contato "
+                "de alguém ou para enviar SMS/mensagem."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Nome da pessoa (ou parte do nome).",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "send_email",
             "description": (
                 "Envia um e-mail do usuário. SÓ chame após mostrar o rascunho "
@@ -242,6 +270,53 @@ def _snippet(text: str, limit: int = None) -> str:
     limit = limit or EMAIL_SNIPPET_CHARS
     clean = re.sub(r"\s+", " ", (text or "")).strip()
     return clean[:limit] + ("…" if len(clean) > limit else "")
+
+
+def _strip_accents(text: str) -> str:
+    """Minúsculas sem acentos — casamento genérico de nomes (cris→Cristina)."""
+    return "".join(c for c in unicodedata.normalize("NFD", str(text or ""))
+                   if unicodedata.category(c) != "Mn").lower().strip()
+
+
+_SELF_TARGET = re.compile(r"\b(mim|eu mesmo|eu mesma|eu pr[oó]prio|minha pessoa)\b", re.I)
+
+
+def resolve_recipient(target, user_id: str = "") -> dict:
+    """Resolve o destinatário dito pelo usuário, do mais genérico ao específico.
+
+    - "para mim"/"pra mim"/"eu mesmo" -> o próprio dono da skill (EMAIL_SENDER,
+      o mesmo endereço que envia e recebe);
+    - endereço com "@" -> direto;
+    - nome (parcial, sem acentos: "cris" acha Cristina, "rafa" acha Rafael) ->
+      agenda (cache 1º, mail no miss, grava no cache).
+    Retorna {"tipo": mim|endereco|unico|varios|nenhum|vazio|erro, ...}. Nunca lança.
+    """
+    target = str(target or "").strip()
+    if not target:
+        return {"tipo": "vazio"}
+    if _SELF_TARGET.search(target):
+        own = os.getenv("EMAIL_SENDER") or ""
+        if not own:
+            return {"tipo": "erro", "erro": "endereço do dono não configurado (EMAIL_SENDER)"}
+        return {"tipo": "mim", "email": own, "nome": "você mesmo"}
+    if "@" in target:
+        return {"tipo": "endereco", "email": target, "nome": target}
+    result = _search_contact(target, user_id)
+    cands = result.get("candidatos") or []
+    if not cands and " " in target:
+        # alvo com várias palavras (ex.: "rafael que ok"): tenta cada token,
+        # mais longo primeiro — adapta a nomes em qualquer posição da fala.
+        for token in sorted((t for t in target.split() if len(t) >= 3),
+                            key=len, reverse=True):
+            cands = _search_contact(token, user_id).get("candidatos") or []
+            if cands:
+                break
+    if len(cands) == 1:
+        return {"tipo": "unico", "email": cands[0].get("email", ""),
+                "nome": cands[0].get("nome", "") or cands[0].get("email", "")}
+    if cands:
+        return {"tipo": "varios", "candidatos": cands[:3], "nome": target}
+    return {"tipo": "nenhum", "nome": target}
 
 
 def _search_contact(name: str, user_id: str) -> dict:
@@ -302,7 +377,23 @@ def _tool_payload(name: str, arguments: str, user_id: str = "") -> dict:
         addresses = result.get("data") or []
         return {"total": len(addresses), "enderecos": addresses}
     elif name == "search_contact":
-        return _search_contact(args.get("name"), user_id)
+        target = str(args.get("name") or "").strip()
+        if _SELF_TARGET.search(target):
+            res = resolve_recipient(target, user_id)
+            if res.get("tipo") == "mim":
+                return {"fonte": "eu", "total": 1,
+                        "candidatos": [{"nome": "eu mesmo (o dono da skill)",
+                                        "email": res["email"]}]}
+            return {"fonte": "nenhuma", "total": 0, "candidatos": [],
+                    "erro": res.get("erro", "não sei quem é o dono (EMAIL_SENDER ausente)")}
+        return _search_contact(target, user_id)
+    elif name == "contact_phones":
+        result = contacts.contact_phones(user_id, str(args.get("name") or "").strip())
+        if not result.get("ok"):
+            return {"erro": result.get("error", "contato não encontrado")}
+        d = result.get("data") or {}
+        return {"nome": d.get("nome", ""), "telefones": d.get("telefones", []),
+                "emails": d.get("emails", []), "fonte": d.get("fonte", "")}
     elif name == "read_email":
         uid = str(args.get("uid") or "").strip()
         position = args.get("position")
