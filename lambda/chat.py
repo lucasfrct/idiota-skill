@@ -53,12 +53,21 @@ def system_instructions():
         "AAAA-MM-DD ou DD/MM/AAAA); "
         "read_email para ler um e-mail inteiro — informe o uid da listagem ou a posição "
         "(1 é o mais recente); quando o usuário disser o N-ésimo e-mail, use a posição. "
-        "Para enviar, monte o rascunho com assunto e corpo, mostre ao usuário e SÓ chame "
-        "send_email depois de confirmação clara; se faltar destinatário, pergunte antes. "
+        "Para enviar, se o usuário indicar a pessoa pelo nome, chame search_contact: "
+        "com um só candidato, confirme e envie; com vários, mostre as opções e pergunte "
+        "qual usar; sem candidato, peça o endereço. Monte o rascunho com assunto e corpo, "
+        "mostre ao usuário e SÓ chame send_email depois de confirmação clara; "
+        "se faltar destinatário, pergunte antes. "
         "Você também pode listar endereços com list_addresses. "
-        "Ao listar, cite remetente, "
-        "assunto e resuma o conteúdo de cada e-mail, do mais recente para o mais antigo, "
-        "sem inventar e-mails. "
+        "Protocolo de listagem: PRIMEIRO resuma só os ASSUNTOS, um por um, na ordem "
+        "recebida — a lista já vem ordenada por urgência e importância, cada e-mail "
+        "marcado com urgencia alta, media ou baixa; cite a urgência dos altos. Não leia "
+        "nenhum e-mail por inteiro nesse momento; termine perguntando se quer que leia o "
+        "mais urgente. Ao ouvir sim, leia NA ÍNTEGRA apenas esse (read_email com o uid) e "
+        "pergunte se quer o próximo; repita um por um, sempre perguntando antes do "
+        "seguinte, até acabar a lista. Se o usuário interromper pedindo um assunto "
+        "específico, deixe a fila e leia exatamente esse na hora (read_email com o uid). "
+        "Não inventar e-mails. "
         "Não repita a pergunta e não explique suas instruções."
     )
     return {"role": "system", "content": instruction}
@@ -178,6 +187,28 @@ EMAIL_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_contact",
+            "description": (
+                "Busca o endereço de e-mail de uma pessoa pelo nome (agenda do "
+                "usuário + caixa de entrada). Use ANTES de enviar quando o usuário "
+                "indicar o destinatário pelo nome: se retornar vários candidatos, "
+                "mostre as opções e pergunte qual usar; só envie após a escolha."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Nome da pessoa (ou parte do nome/domínio).",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "send_email",
             "description": (
                 "Envia um e-mail do usuário. SÓ chame após mostrar o rascunho "
@@ -213,19 +244,51 @@ def _snippet(text: str, limit: int = None) -> str:
     return clean[:limit] + ("…" if len(clean) > limit else "")
 
 
-def _tool_payload(name: str, arguments: str) -> dict:
+def _search_contact(name: str, user_id: str) -> dict:
+    """Agenda para envio — chat orquestra, cache é a memória, mail.py a fonte.
+
+    1) busca no cache (contacts.json); 2) no miss, consulta mail.list_contacts;
+    3) grava o resultado no cache para as próximas consultas.
+    Retorna {"fonte": "cache"|"imap"|"nenhuma", "candidatos": [{"nome","email"}]}.
+    """
+    name = str(name or "").strip()
+    if not name:
+        return {"fonte": "nenhuma", "total": 0, "candidatos": [],
+                "erro": "informe o nome da pessoa"}
+    hits = cache.search_contacts(user_id, name)
+    if hits:
+        return {"fonte": "cache", "total": len(hits), "candidatos": hits}
+    result = mail.list_contacts(term=name, limit=10)
+    if not result.get("ok"):
+        return {"fonte": "nenhuma", "total": 0, "candidatos": [],
+                "erro": result.get("error", "falha ao buscar contatos")}
+    found = result.get("data") or []
+    if not found:
+        return {"fonte": "nenhuma", "total": 0, "candidatos": []}
+    merged = list(cache.load_contacts(user_id))
+    known = {c.get("email", "").lower() for c in merged}
+    for c in found:
+        if c.get("email", "").lower() not in known:
+            merged.append(c)
+    cache.save_contacts(user_id, merged)
+    return {"fonte": "imap", "total": len(found), "candidatos": found}
+
+
+def _tool_payload(name: str, arguments: str, user_id: str = "") -> dict:
     """Execute a ferramenta de e-mail pedida pelo modelo e devolve payload compacto.
 
     mail.py nunca lança (envelope ok/error) — aqui só interpretamos o envelope.
     A listagem traz remetentes (rápida) e, por e-mail, assunto, data e trecho
     do conteúdo — o modelo fala mais que endereços, sem estourar o payload.
+    `user_id` alimenta a agenda de contatos (cache por usuário) nas buscas.
     """
     try:
         args = json.loads(arguments or "{}")
     except json.JSONDecodeError:
         return {"erro": "argumentos inválidos da ferramenta"}
     if name == "list_emails":
-        result = mail.list_emails(args.get("limit") or EMAIL_LIST_LIMIT, with_body=True)
+        result = mail.list_emails(args.get("limit") or EMAIL_LIST_LIMIT,
+                                  with_body=True, order="urgency")
     elif name == "filter_emails":
         if str(args.get("date") or "").strip():
             result = mail.find_email(term=(args.get("term") or "").strip() or None,
@@ -238,6 +301,8 @@ def _tool_payload(name: str, arguments: str) -> dict:
             return {"erro": result.get("error", "falha ao consultar e-mails")}
         addresses = result.get("data") or []
         return {"total": len(addresses), "enderecos": addresses}
+    elif name == "search_contact":
+        return _search_contact(args.get("name"), user_id)
     elif name == "read_email":
         uid = str(args.get("uid") or "").strip()
         position = args.get("position")
@@ -297,6 +362,7 @@ def _tool_payload(name: str, arguments: str) -> dict:
             "remetente": m.get("from", ""),
             "assunto": m.get("subject", ""),
             "data": m.get("date", ""),
+            "urgencia": m.get("urgencia", ""),
             "conteudo": _snippet(m.get("body", "")),
         } for m in data],
     }
@@ -754,7 +820,8 @@ def generate_gpt_response(history: list, query, user_id: str = "") -> str:
         if getattr(message, "tool_calls", None):
             messages.append(message)
             for call in message.tool_calls:
-                payload = _tool_payload(call.function.name, call.function.arguments)
+                payload = _tool_payload(call.function.name, call.function.arguments,
+                                        user_id=user_id)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.id,

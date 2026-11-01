@@ -32,6 +32,10 @@ Coleções:
                     sessões até "pronto" (e-mail) ou "sua vez" (conversa).
 - notes.json      — notas explícitas ("anote que ...") por usuário
                     {user_id: {"notes": [{"text", "at"}], "updated"}}.
+- contacts.json   — agenda de contatos (nome <-> e-mail) por usuário, alimentada
+                    pelo chat: consulta ao mail.py é gravada aqui; envio consulta
+                    o cache primeiro. {user_id: {"contacts": [{"nome", "email"}],
+                    "updated"}}.
 """
 import json
 import logging
@@ -39,6 +43,7 @@ import os
 import re
 import tempfile
 import threading
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -52,6 +57,7 @@ MAX_ERRORS = int(os.getenv("CACHE_MAX_ERRORS", "200"))
 MAX_EMAILS = int(os.getenv("CACHE_MAX_EMAILS", "200"))
 MAX_DICTATION_CHUNKS = int(os.getenv("CACHE_MAX_DICTATION_CHUNKS", "200"))
 MAX_NOTES = int(os.getenv("CACHE_MAX_NOTES", "500"))
+MAX_CONTACTS = int(os.getenv("CACHE_MAX_CONTACTS", "200"))
 BODY_MAX = int(os.getenv("CACHE_BODY_MAX", "2000"))
 TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "7"))  # 0 desativa a expiração
 
@@ -59,6 +65,7 @@ CHATS = "chats"
 EMAILS = "emails"
 DICTATIONS = "dictations"
 NOTES = "notes"
+CONTACTS = "contacts"
 
 _lock = threading.RLock()
 _mirror = {}   # name -> {"mtime_ns": int, "data": ...}
@@ -352,6 +359,84 @@ def clear_notes(user_id: str) -> bool:
     except Exception as e:
         logger.error("cache: clear_notes failed: %s", e)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Frente 5 — agenda de contatos (nome <-> e-mail; cache das consultas de envio)
+# ---------------------------------------------------------------------------
+
+def _norm(value: str) -> str:
+    """Minúsculas sem acentos — comparação tolerante de nomes/endereços."""
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(c for c in text if not unicodedata.combining(c)).lower().strip()
+
+
+def load_contacts(user_id: str) -> list:
+    """Agenda do usuário ([{"nome", "email"}]; [] se não houver/expirada)."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return []
+        data = read_json(CONTACTS, default={}) or {}
+        entry = data.get(user_id)
+        if not entry or _expired(entry.get("updated")):
+            return []
+        return [dict(c) for c in entry.get("contacts", [])]
+    except Exception as e:
+        logger.error("cache: load_contacts failed: %s", e)
+        return []
+
+
+def save_contacts(user_id: str, contacts: list) -> bool:
+    """Substitui a agenda do usuário (dedupe por e-mail; bounded; evict antigos)."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return False
+        kept, seen = [], set()
+        for c in contacts or []:
+            email = str((c or {}).get("email", "")).strip().lower()
+            if "@" not in email or email in seen:
+                continue
+            seen.add(email)
+            kept.append({"nome": str((c or {}).get("nome", "")).strip()[:120],
+                         "email": email})
+
+        def fn(data):
+            data = dict(data or {})
+            cutoff = _cutoff()
+            if cutoff:
+                data = {k: v for k, v in data.items()
+                        if k == user_id or not _expired((v or {}).get("updated"), cutoff)}
+            data[user_id] = {"contacts": kept[-max(1, MAX_CONTACTS):], "updated": _now()}
+            if len(data) > max(1, MAX_USERS):
+                oldest = sorted(
+                    (k for k in data if k != user_id),
+                    key=lambda k: data[k].get("updated", ""),
+                )
+                for k in oldest[: len(data) - max(1, MAX_USERS)]:
+                    data.pop(k, None)
+            return data
+
+        return update_json(CONTACTS, fn, default={})
+    except Exception as e:
+        logger.error("cache: save_contacts failed: %s", e)
+        return False
+
+
+def search_contacts(user_id: str, name: str, limit=10) -> list:
+    """Candidatos da agenda cujo nome OU e-mail casa com o termo (sem acentos)."""
+    try:
+        needle = _norm(name)
+        if not needle:
+            return []
+        hits = [c for c in load_contacts(user_id)
+                if needle in _norm(c.get("nome", ""))
+                or needle in _norm(c.get("email", ""))]
+        return hits[:max(1, int(limit))]
+    except Exception as e:
+        logger.error("cache: search_contacts failed: %s", e)
+        return []
 
 
 # ---------------------------------------------------------------------------

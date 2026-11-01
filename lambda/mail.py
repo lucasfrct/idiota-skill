@@ -351,13 +351,69 @@ def send_email(subject=None, body=None, from_email=None, to_email=None):
         return _err(f"Falha ao enviar e-mail: {e}")
 
 
-def list_emails(limit=10, with_body=True):
+# Ordem de urgência/importância para a leitura da caixa de entrada
+URGENT_KEYWORDS = (
+    "urgente", "prazo", "vence", "vencimento", "hoje", "amanh", "multa",
+    "jurídico", "juridico", "tribunal", "processo", "cobran", "inadimpl",
+    "bloquead", "suspens", "fiscal", "imposto", "regulariz", "penalidade",
+    "notificação", "notificacao", "rescis", "protesto", "serasa", "spc",
+)
+IMPORTANT_KEYWORDS = (
+    "reuni", "responder", "aguardando", "pendente", "confirma", "agenda",
+    "renova", "assinatura", "contrato", "pagamento", "fatura", "nota fiscal",
+    "lembrete", "orçamento", "orcamento", "proposta", "comunicado", "verificar",
+    "document", "autoriz", "agend", "convoc",
+)
+
+
+def urgency_score(item) -> int:
+    """Pontuação determinística de urgência/importância de um e-mail.
+
+    Palavras de prazo/cobrança/jurídico pesam mais; recência soma; remetente
+    no-reply desce (comunicados transacionais raramente são urgentes).
+    """
+    hay = " ".join((item.get("subject", ""), item.get("from", ""),
+                    item.get("body", ""))).lower()
+    score = min(75, 25 * sum(1 for k in URGENT_KEYWORDS if k in hay))
+    score += min(30, 10 * sum(1 for k in IMPORTANT_KEYWORDS if k in hay))
+    day = _day_key(item.get("date"))
+    today = _date.today().isoformat()
+    if day == today:
+        score += 15
+    elif day == (_date.today() - timedelta(days=1)).isoformat():
+        score += 8
+    elif day >= (_date.today() - timedelta(days=7)).isoformat():
+        score += 4
+    sender = item.get("from", "").lower()
+    if "no-reply" in sender or "noreply" in sender or "naoresponda" in sender:
+        score -= 15
+    return score
+
+
+def urgency_label(score) -> str:
+    """Rótulo de urgência para narração: alta | media | baixa."""
+    if score >= 40:
+        return "alta"
+    if score >= 15:
+        return "media"
+    return "baixa"
+
+
+def list_emails(limit=10, with_body=True, order="recent"):
     """Lista os e-mails recentes da caixa de entrada COMPLETOS por padrão:
     remetente, assunto, data, corpo integral e links extraídos.
-    with_body=False devolve só cabeçalhos (leve, para uso interno)."""
+    with_body=False devolve só cabeçalhos (leve, para uso interno).
+    order="urgency" ordena por urgência/importância (heurística local:
+    palavras de prazo/cobrança/jurídico, recência; remetente no-reply desce)
+    e marca cada item com "urgencia": alta | media | baixa."""
     try:
         limit = max(1, int(limit))
-        return _ok(_fetch_messages("ALL", limit, with_body=with_body))
+        items = _fetch_messages("ALL", limit, with_body=with_body)
+        if order == "urgency":
+            for item in items:
+                item["urgencia"] = urgency_label(urgency_score(item))
+            items.sort(key=urgency_score, reverse=True)  # estável: empate = mais novo 1º
+        return _ok(items)
     except ValueError as e:
         return _err(e)
     except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
@@ -467,6 +523,39 @@ def list_addresses(term=None, limit=50):
         return _err(e)
     except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
         return _err(f"Falha ao listar endereços: {e}")
+
+
+def list_contacts(term=None, limit=50):
+    """Contatos da caixa de entrada: [{"nome", "email"}] dedupe, recentes 1º.
+
+    Nome = display name do cabeçalho From (fallback: parte local do endereço).
+    Filtro opcional por termo (casado no nome OU no endereço). Envelope ok/error.
+    """
+    try:
+        limit = max(1, int(limit))
+        scan = max(limit * 5, 50)
+        messages = _fetch_messages("ALL", scan, with_body=False)
+        needle = (term or "").strip().lower()
+        contacts, seen = [], set()
+        for m in messages:
+            for name, addr in getaddresses([m["from"]]):
+                addr = (addr or "").strip().lower()
+                if "@" not in addr or addr in seen:
+                    continue
+                name = re.sub(r"\s+", " ", (name or "")).strip().strip('"')
+                if not name:
+                    name = addr.split("@", 1)[0].replace(".", " ").replace("_", " ").title()
+                if needle and needle not in addr and needle not in name.lower():
+                    continue
+                seen.add(addr)
+                contacts.append({"nome": name, "email": addr})
+                if len(contacts) >= limit:
+                    return _ok(contacts)
+        return _ok(contacts)
+    except ValueError as e:
+        return _err(e)
+    except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
+        return _err(f"Falha ao listar contatos: {e}")
 
 
 def format_email_blocks(items):
