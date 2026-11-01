@@ -48,7 +48,10 @@ def system_instructions():
         "Você se lembra das últimas mensagens da conversa e tem ferramenta de e-mail: "
         "quando o usuário pedir para ver, listar ou procurar e-mails, chame list_emails "
         "ou filter_emails antes de responder; para perguntas sobre QUEM mandou e-mails "
-        "ou sobre endereços/contatos, chame list_addresses. Ao listar, cite remetente, "
+        "ou sobre endereços/contatos, chame list_addresses; para LER um e-mail "
+        "específico escolhido por remetente, assunto/título ou data (hoje, ontem, "
+        "AAAA-MM-DD, DD/MM/AAAA), chame read_email e conte o conteúdo fielmente. "
+        "Ao listar, cite remetente, "
         "assunto e resuma o conteúdo de cada e-mail, do mais recente para o mais antigo, "
         "sem inventar e-mails. "
         "Não repita a pergunta e não explique suas instruções."
@@ -120,6 +123,40 @@ EMAIL_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_email",
+            "description": (
+                "Lê um e-mail ESPECÍFICO por completo, com o corpo inteiro. Use "
+                "quando o usuário quiser LER um e-mail que escolheu por remetente, "
+                "por assunto/título ou por data (hoje, ontem, AAAA-MM-DD ou "
+                "DD/MM/AAAA). Combine critérios para achar o e-mail certo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sender": {
+                        "type": "string",
+                        "description": "Remetente: nome, endereço ou domínio.",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Palavra(s) do assunto/título do e-mail.",
+                    },
+                    "term": {
+                        "type": "string",
+                        "description": "Termo livre no remetente, assunto ou corpo.",
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Data do e-mail: hoje, ontem, anteontem, AAAA-MM-DD ou DD/MM/AAAA.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -151,6 +188,19 @@ def _tool_payload(name: str, arguments: str) -> dict:
             return {"erro": result.get("error", "falha ao consultar e-mails")}
         addresses = result.get("data") or []
         return {"total": len(addresses), "enderecos": addresses}
+    elif name == "read_email":
+        result = mail.find_email(term=args.get("term"), sender=args.get("sender"),
+                                 subject=args.get("subject"), date=args.get("date"),
+                                 limit=3)
+        if not result.get("ok"):
+            return {"erro": result.get("error", "falha ao ler o e-mail")}
+        found = result.get("data") or []
+        return {"total": len(found), "emails": [{
+            "remetente": m.get("from", ""),
+            "assunto": m.get("subject", ""),
+            "data": m.get("date", ""),
+            "corpo_completo": _snippet(m.get("body", ""), 1500),
+        } for m in found]}
     else:
         return {"erro": f"ferramenta desconhecida: {name}"}
     if not result.get("ok"):
@@ -275,6 +325,59 @@ def send_composed_email(message, from_email=None, to_email=None):
         return {"ok": False, "error": "Mensagem vazia: nada para enviar"}
     return mail.send_email(subject=draft["subject"], body=draft["body"],
                            from_email=from_email, to_email=to_email)
+
+
+# ---------------------------------------------------------------------------
+# Ditado longo — anotação multi-turno/multi-sessão com síntese no fim
+# ---------------------------------------------------------------------------
+
+DICTATION_CHUNK_CHARS = int(os.getenv("DICTATION_CHUNK_CHARS", "600"))
+DICTATION_TOTAL_CHARS = int(os.getenv("DICTATION_TOTAL_CHARS", "24000"))
+
+
+def dictation_append(user_id: str, text) -> dict:
+    """Anota um trecho falado no rascunho persistente do usuário (cache).
+
+    Limites: por trecho (DICTATION_CHUNK_CHARS) e total (DICTATION_TOTAL_CHARS).
+    Retorna {"ok": True, "chunks", "chars"} ou {"ok": False, "error"} — nunca lança.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return {"ok": False, "error": "Trecho vazio"}
+    if len(text) > DICTATION_CHUNK_CHARS:
+        return {"ok": False, "error": (
+            f"Trecho longo demais ({len(text)} caracteres; máximo {DICTATION_CHUNK_CHARS}) — divida em partes")}
+    chunks = cache.load_dictation(user_id)
+    total = sum(len(c) for c in chunks) + len(text)
+    if total > DICTATION_TOTAL_CHARS:
+        return {"ok": False, "error": (
+            f"Rascunho cheio ({total} de {DICTATION_TOTAL_CHARS} caracteres) — diga pronto para enviar o que já tem")}
+    chunks.append(text)
+    if not cache.save_dictation(user_id, chunks):
+        return {"ok": False, "error": "Falha ao salvar a anotação"}
+    return {"ok": True, "chunks": len(chunks), "chars": total}
+
+
+def dictation_text(user_id: str) -> str:
+    """Anotações acumuladas do usuário, na ordem falada."""
+    return "\n".join(cache.load_dictation(user_id)).strip()
+
+
+def dictation_clear(user_id: str) -> bool:
+    """Descarta o rascunho do usuário (após envio ou pedido explícito)."""
+    return cache.clear_dictation(user_id)
+
+
+def dictation_synthesize(user_id: str):
+    """Une todas as anotações e sintetiza (GPT) o e-mail pronto p/ confirmar.
+
+    O rascunho permanece no cache até o envio — rejeitar a síntese não perde
+    as anotações. Retorna {"subject", "body"} ou None (nunca lança).
+    """
+    full = dictation_text(user_id)
+    if not full:
+        return None
+    return generate_email(full)
 
 
 def generate_gpt_response(history: list, query) -> str:

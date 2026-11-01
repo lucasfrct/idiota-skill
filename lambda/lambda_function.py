@@ -82,6 +82,26 @@ def get_email_flow(handler_input):
     return session_attr.get("email_flow")
 
 
+def is_dictating(handler_input) -> bool:
+    """Modo ditado é POR SESSÃO (explícito); o conteúdo fica no cache e
+    sobrevive a sessões — retomar = dizer 'ditar um e-mail' de novo."""
+    session_attr = handler_input.attributes_manager.session_attributes
+    return bool(session_attr.get("dictating"))
+
+
+def acknowledge_chunk(handler_input, app):
+    """Fala curta pós-anotação + mantém a sessão aberta para o próximo trecho."""
+    speak_output = (
+        f"Anotado, parte {app['chunks']}. Continue ditando, ou diga pronto."
+        if app.get("ok") else app.get("error", "Não consegui anotar.")
+    )
+    return (
+        handler_input.response_builder.speak(speak_output)
+        .ask("Continuo anotando. Continue.")
+        .response
+    )
+
+
 def clear_email_flow(handler_input):
     handler_input.attributes_manager.session_attributes.pop("email_flow", None)
 
@@ -157,6 +177,10 @@ def send_pending_email(handler_input):
         info=str(info),
     )
 
+    # Ditado enviado com sucesso: o rascunho cumpriu seu papel — descarta.
+    if ok:
+        chat.dictation_clear(user_id(handler_input))
+
     # Fala derivada do envelope (send_email nunca lança; nunca falar dict)
     if ok:
         return str(info) or f"E-mail enviado com sucesso para {EMAIL_RECIPIENT}."
@@ -171,6 +195,9 @@ class LaunchRequestHandler(AbstractRequestHandler):
     def handle(self, handler_input):
         # type: (HandlerInput) -> Response
         clear_email_flow(handler_input)
+        # Sessão nova = modo ditado desligado (o rascunho persiste no cache —
+        # retomar é explícito: "ditar um e-mail").
+        handler_input.attributes_manager.session_attributes.pop("dictating", None)
         # Memória de turnos: restaura a conversa anterior do usuário (cache
         # local); se não houver, começa vazia — degradação suave.
         handler_input.attributes_manager.session_attributes["chat_history"] = (
@@ -178,7 +205,7 @@ class LaunchRequestHandler(AbstractRequestHandler):
         )
         speak_output = (
             "Olá! Sou o Idiota. Pode fazer sua pergunta, "
-            "ou pedir para eu enviar um e-mail."
+            "ditar um e-mail longo, ou pedir para eu enviar um e-mail."
         )
 
         return (
@@ -200,6 +227,18 @@ class GptQueryIntentHandler(AbstractRequestHandler):
         # type: (HandlerInput) -> Response
         try:
             query = ask_utils.get_slot_value(handler_input=handler_input, slot_name="query")
+
+            # Modo ditado: fala livre é ANOTAÇÃO, não pergunta ao GPT.
+            if is_dictating(handler_input):
+                if query:
+                    app = chat.dictation_append(user_id(handler_input), query)
+                    return acknowledge_chunk(handler_input, app)
+                speak_output = "Não ouvi o trecho. Fale de novo."
+                return (
+                    handler_input.response_builder.speak(speak_output)
+                    .ask("Continuo anotando. Continue.")
+                    .response
+                )
 
             if get_email_flow(handler_input) == "awaiting_body":
                 clear_email_flow(handler_input)
@@ -267,6 +306,121 @@ class SendEmailIntentHandler(AbstractRequestHandler):
             )
 
 
+class StartDictationIntentHandler(AbstractRequestHandler):
+    """Inicia (ou retoma) o ditado longo de um e-mail, entre sessões."""
+
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return ask_utils.is_intent_name("StartDictationIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        try:
+            clear_email_flow(handler_input)
+            handler_input.attributes_manager.session_attributes["dictating"] = True
+            uid = user_id(handler_input)
+            chunks = cache.load_dictation(uid)
+            if chunks:
+                speak_output = (
+                    f"Você já tinha {len(chunks)} anotação(ões) guardadas. "
+                    "Continuo de onde paramos — fale a próxima parte."
+                )
+            else:
+                speak_output = (
+                    "Modo ditado ativado. Fale o conteúdo do e-mail em partes, "
+                    "eu anoto tudo e não perco nada entre os turnos. "
+                    "Quando terminar, diga pronto."
+                )
+            return (
+                handler_input.response_builder.speak(speak_output)
+                .ask("Estou anotando. Continue.")
+                .response
+            )
+        except Exception as e:
+            logger.error(f"Error in StartDictationIntentHandler: {e}")
+            speak_output = "Não consegui iniciar o ditado."
+            return (
+                handler_input.response_builder.speak(speak_output)
+                .ask(ASK_REPROMPT)
+                .response
+            )
+
+
+class DictationChunkIntentHandler(AbstractRequestHandler):
+    """Captura um trecho dito com frase portadora (anote/continuar)."""
+
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return ask_utils.is_intent_name("DictationChunkIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        try:
+            handler_input.attributes_manager.session_attributes["dictating"] = True
+            text = ask_utils.get_slot_value(handler_input=handler_input, slot_name="text")
+            if not text:
+                speak_output = "Não ouvi o trecho. Fale de novo."
+                return (
+                    handler_input.response_builder.speak(speak_output)
+                    .ask("Continuo anotando. Continue.")
+                    .response
+                )
+            app = chat.dictation_append(user_id(handler_input), text)
+            return acknowledge_chunk(handler_input, app)
+        except Exception as e:
+            logger.error(f"Error in DictationChunkIntentHandler: {e}")
+            speak_output = "Problema ao anotar o trecho."
+            return (
+                handler_input.response_builder.speak(speak_output)
+                .ask("Tente de novo.")
+                .response
+            )
+
+
+class FinishDictationIntentHandler(AbstractRequestHandler):
+    """Encerra o ditado: sintetiza (GPT) as anotações e pede confirmação."""
+
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return ask_utils.is_intent_name("FinishDictationIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        try:
+            uid = user_id(handler_input)
+            chunks = cache.load_dictation(uid)
+            if not chunks:
+                speak_output = "Não há ditado em andamento. Diga: ditar um e-mail, para começar."
+                return (
+                    handler_input.response_builder.speak(speak_output)
+                    .ask(ASK_REPROMPT)
+                    .response
+                )
+            draft = chat.dictation_synthesize(uid)
+            if not draft or not draft.get("body"):
+                speak_output = (
+                    "Não consegui organizar as anotações num e-mail. "
+                    "Continue ditando, ou diga sair."
+                )
+                return (
+                    handler_input.response_builder.speak(speak_output)
+                    .ask("Continue ditando.")
+                    .response
+                )
+            # Modo ditado encerra na sessão; o rascunho fica no cache até o
+            # envio — rejeitar a confirmação não perde as anotações.
+            handler_input.attributes_manager.session_attributes["dictating"] = False
+            return ask_email_confirmation(handler_input, draft.get("subject", ""), draft["body"])
+        except Exception as e:
+            logger.error(f"Error in FinishDictationIntentHandler: {e}")
+            speak_output = "Problema ao organizar o ditado. Tente de novo."
+            return (
+                handler_input.response_builder.speak(speak_output)
+                .ask("Tente de novo.")
+                .response
+            )
+
+
 class YesIntentHandler(AbstractRequestHandler):
     """Confirms the pending email (or acknowledges no pending action)"""
 
@@ -301,7 +455,13 @@ class NoIntentHandler(AbstractRequestHandler):
         flow = get_email_flow(handler_input)
         clear_email_flow(handler_input)
         if isinstance(flow, dict) and "body" in flow:
-            speak_output = "Tudo bem, não enviei o e-mail."
+            if cache.load_dictation(user_id(handler_input)):
+                speak_output = (
+                    "Tudo bem, não enviei. Suas anotações do ditado continuam "
+                    "guardadas — continue ditando mais tarde, ou diga pronto."
+                )
+            else:
+                speak_output = "Tudo bem, não enviei o e-mail."
         else:
             speak_output = "Ok. Pode fazer sua pergunta."
 
@@ -400,6 +560,9 @@ class CatchAllExceptionHandler(AbstractExceptionHandler):
 sb = SkillBuilder()
 
 sb.add_request_handler(LaunchRequestHandler())
+sb.add_request_handler(StartDictationIntentHandler())
+sb.add_request_handler(DictationChunkIntentHandler())
+sb.add_request_handler(FinishDictationIntentHandler())
 sb.add_request_handler(GptQueryIntentHandler())
 sb.add_request_handler(SendEmailIntentHandler())
 sb.add_request_handler(YesIntentHandler())

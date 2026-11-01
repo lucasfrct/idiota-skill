@@ -82,6 +82,47 @@
             "enviar e-mail dizendo {message}",
             "enviar e-mail"
           ]
+        },
+        {
+          "name": "StartDictationIntent",
+          "samples": [
+            "ditar um e-mail",
+            "começar a ditar",
+            "comecar a ditar",
+            "ditar e-mail",
+            "anotar um e-mail",
+            "quero ditar um e-mail",
+            "continuar o ditado",
+            "continuar o ditado do e-mail"
+          ]
+        },
+        {
+          "slots": [
+            {
+              "name": "text",
+              "type": "AMAZON.Person"
+            }
+          ],
+          "name": "DictationChunkIntent",
+          "samples": [
+            "anote {text}",
+            "anota {text}",
+            "continuar {text}",
+            "mais um pedaço {text}",
+            "mais um pedaco {text}",
+            "anota que {text}"
+          ]
+        },
+        {
+          "name": "FinishDictationIntent",
+          "samples": [
+            "pronto",
+            "terminei o ditado",
+            "acabou o ditado",
+            "finalize o ditado",
+            "pode enviar o ditado",
+            "terminei de ditar"
+          ]
         }
       ],
       "types": [],

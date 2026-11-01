@@ -19,10 +19,13 @@ Mecânica:
   a skill; em falha retorna valor seguro (default / False / lista vazia).
 
 Coleções:
-- chats.json  — memória de turnos por usuário {user_id: {"history", "updated"}}
-- emails.json — {"registry" (e-mails disponíveis), "sent" (enviados),
-                 "errors" (falhas), "seq"} com metadados (para, assunto,
-                 mensagem, data, resultado).
+- chats.json     — memória de turnos por usuário {user_id: {"history", "updated"}}
+- emails.json    — {"registry" (e-mails disponíveis), "sent" (enviados),
+                   "errors" (falhas), "seq"} com metadados (para, assunto,
+                   mensagem, data, resultado).
+- dictations.json — rascunho de ditado longo por usuário
+                   {user_id: {"chunks", "updated"}} — anotações acumuladas
+                   entre turnos/sessões até "pronto" sintetizar e enviar.
 """
 import json
 import logging
@@ -41,11 +44,13 @@ MAX_USERS = int(os.getenv("CACHE_MAX_USERS", "50"))
 MAX_SENT = int(os.getenv("CACHE_MAX_SENT", "500"))
 MAX_ERRORS = int(os.getenv("CACHE_MAX_ERRORS", "200"))
 MAX_EMAILS = int(os.getenv("CACHE_MAX_EMAILS", "200"))
+MAX_DICTATION_CHUNKS = int(os.getenv("CACHE_MAX_DICTATION_CHUNKS", "200"))
 BODY_MAX = int(os.getenv("CACHE_BODY_MAX", "2000"))
 TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "7"))  # 0 desativa a expiração
 
 CHATS = "chats"
 EMAILS = "emails"
+DICTATIONS = "dictations"
 
 _lock = threading.RLock()
 _mirror = {}   # name -> {"mtime_ns": int, "data": ...}
@@ -220,6 +225,76 @@ def clear_chat(user_id: str) -> bool:
         return update_json(CHATS, fn, default={})
     except Exception as e:
         logger.error("cache: clear_chat failed: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Frente 3 — ditado longo (rascunho multi-sessão por usuário)
+# ---------------------------------------------------------------------------
+
+def load_dictation(user_id: str) -> list:
+    """Ditado acumulado do usuário ([] se não houver/expirado)."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return []
+        data = read_json(DICTATIONS, default={}) or {}
+        entry = data.get(user_id)
+        if not entry or _expired(entry.get("updated")):
+            return []
+        return list(entry.get("chunks", []))
+    except Exception as e:
+        logger.error("cache: load_dictation failed: %s", e)
+        return []
+
+
+def save_dictation(user_id: str, chunks: list) -> bool:
+    """Persist the dictation buffer for a user (bounded; evicts oldest/expired)."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return False
+        kept = [str(c) for c in (chunks or [])][-max(1, MAX_DICTATION_CHUNKS):]
+
+        def fn(data):
+            data = dict(data or {})
+            cutoff = _cutoff()
+            if cutoff:
+                data = {k: v for k, v in data.items()
+                        if k == user_id or not _expired((v or {}).get("updated"), cutoff)}
+            data[user_id] = {"chunks": kept, "updated": _now()}
+            if len(data) > max(1, MAX_USERS):
+                oldest = sorted(
+                    (k for k in data if k != user_id),
+                    key=lambda k: data[k].get("updated", ""),
+                )
+                for k in oldest[: len(data) - max(1, MAX_USERS)]:
+                    data.pop(k, None)
+            return data
+
+        return update_json(DICTATIONS, fn, default={})
+    except Exception as e:
+        logger.error("cache: save_dictation failed: %s", e)
+        return False
+
+
+def clear_dictation(user_id: str) -> bool:
+    """Drop a user's dictation buffer."""
+    try:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return False
+
+        def fn(data):
+            data = dict(data or {})
+            if user_id not in data:
+                return None
+            data.pop(user_id, None)
+            return data
+
+        return update_json(DICTATIONS, fn, default={})
+    except Exception as e:
+        logger.error("cache: clear_dictation failed: %s", e)
         return False
 
 

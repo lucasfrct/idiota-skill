@@ -15,6 +15,8 @@ sugerido no fim do fluxo, quando o corpo já existe: suggest_subject(body).
     list_emails([n])           caixa de entrada COMPLETA em blocos: remetente,
                                assunto, data, corpo integral e links extraídos
     list_addresses([termo])    SOMENTE endereços de e-mail (sem mensagem), dedupe
+    find_email(...)            busca e-mail ESPECÍFICO por remetente, assunto,
+                               termo e/ou data — traz corpo completo p/ leitura
     format_email_blocks(items) apresenta os e-mails em blocos legíveis
 
 CLI (standalone usage):
@@ -41,9 +43,11 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import getaddresses
+from email.utils import formatdate, getaddresses, make_msgid, parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
+
+from datetime import date as _date, datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -331,6 +335,8 @@ def send_email(subject=None, body=None, from_email=None, to_email=None):
         message["From"] = from_email
         message["To"] = to_email
         message["Subject"] = subject
+        message["Date"] = formatdate(localtime=True)
+        message["Message-ID"] = make_msgid(domain=from_email.split("@")[-1])
         message.attach(MIMEText(body, "plain", "utf-8"))
 
         with _connect_smtp() as server:
@@ -356,6 +362,84 @@ def list_emails(limit=10, with_body=True):
         return _err(e)
     except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
         return _err(f"Falha ao listar e-mails: {e}")
+
+
+def _day_key(date_hdr):
+    """Chave do dia (AAAA-MM-DD, UTC) a partir do cabeçalho Date; "" se ilegível."""
+    try:
+        return parsedate_to_datetime(date_hdr).astimezone(timezone.utc).date().isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _parse_day(value):
+    """Converte o pedido de data em chave de dia ou substring do cabeçalho.
+
+    Aceita: hoje | ontem | anteontem | AAAA-MM-DD | DD/MM/AAAA | DD-MM-AAAA.
+    Qualquer outro vira substring crua do cabeçalho (ex.: "oct", "31 oct").
+    Retorna (chave_ou_substring, eh_substring).
+    """
+    v = str(value or "").strip().lower()
+    if not v:
+        return None, False
+    today = datetime.now(timezone.utc).date()
+    named = {"hoje": 0, "today": 0, "ontem": 1, "yesterday": 1, "anteontem": 2}
+    if v in named:
+        return (today - timedelta(days=named[v])).isoformat(), False
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", v)
+    if m:
+        return _date(int(m[1]), int(m[2]), int(m[3])).isoformat(), False
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", v)
+    if m:
+        return _date(int(m[3]), int(m[2]), int(m[1])).isoformat(), False
+    return v, True
+
+
+def find_email(term=None, sender=None, subject=None, date=None, limit=5):
+    """Busca e-mails ESPECÍFICOS por remetente, assunto, termo e/ou data.
+
+    Diferente de filter_emails (título/remetente apenas), traz o CORPO COMPLETO
+    de cada resultado — é a operação de leitura de um e-mail escolhido.
+    Data aceita hoje/ontem/anteontem, AAAA-MM-DD, DD/MM/AAAA ou substring do
+    cabeçalho (ex.: "oct"). Pelo menos um critério é exigido. Envelope ok/error.
+    """
+    if not any(str(c or "").strip() for c in (term, sender, subject, date)):
+        return _err("Informe um critério: remetente, assunto, termo ou data")
+    try:
+        limit = max(1, min(int(limit or 5), 20))
+    except (TypeError, ValueError):
+        limit = 5
+
+    day, is_sub = _parse_day(date)
+    needle = str(term or "").strip().lower()
+    sender_n = str(sender or "").strip().lower()
+    subject_n = str(subject or "").strip().lower()
+    date_raw = str(date or "").strip().lower()
+
+    try:
+        messages = _fetch_messages("ALL", max(limit * 10, 60), with_body=True)
+    except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
+        return _err(f"Falha ao buscar e-mails: {e}")
+
+    hits = []
+    for m in messages:
+        if sender_n and sender_n not in m["from"].lower():
+            continue
+        if subject_n and subject_n not in m["subject"].lower():
+            continue
+        if needle and needle not in (
+                m["from"] + " " + m["subject"] + " " + m.get("body", "")).lower():
+            continue
+        if date:
+            if is_sub:
+                if date_raw not in m["date"].lower():
+                    continue
+            elif _day_key(m["date"]) != day:
+                continue
+        hits.append(m)
+        if len(hits) >= limit:
+            break
+    return _ok(hits)
 
 
 def list_addresses(term=None, limit=50):
