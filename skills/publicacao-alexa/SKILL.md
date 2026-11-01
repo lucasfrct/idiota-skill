@@ -103,3 +103,43 @@ Resposta vazia (HTTP 204) = habilitado. Testar no Echo: **"Alexa, abre Idiota"**
 | Listagem cortada no meio | `finish_reason=length` | subir `LISTING_MAX_TOKENS` (default 700) |
 | "conteúdo não disponibilizado" na voz | e-mail só-HTML não parseado | já mitigado (fallback HTML); revisar `_body_text` |
 | Echo não reconhece a skill | enablement ausente / conta diferente | refazer passo 5; Echo deve estar na conta dev |
+
+## 7. Verificação final — publicado na Amazon e instalado no Echo Dot
+
+Rodar SEMPRE no fim do fluxo. Sucesso = os 4 checks abaixo verdes; qualquer
+vermelho → diagnostics (seção 6) antes de anunciar o deploy.
+
+```bash
+# 1) CI concluiu com sucesso (deploy executado)
+gh run list --workflow deploy-alexa.yml --limit 1
+gh run view <run-id> --json conclusion --jq .conclusion   # esperado: "success"
+
+# 2) Lambda atualizada: o último commit do CodeCommit é o deploy DESTE push
+#    (o CI grava "deploy: <sha-do-github>")
+git ls-remote https://git-codecommit.us-east-1.amazonaws.com/v1/repos/a3057584-6fe3-43ab-b326-12be9d687519 master
+git log --oneline -1 origin/main   # conferir que o sha citado no CodeCommit = este push
+# (credenciais do CodeCommit: ask smapi generate-credentials-for-alexa-hosted-skill ...)
+
+# 3) Modelo + manifest publicados (build assíncrono — aguardar ~1 min)
+docker exec idiota-ask ask smapi get-skill-status -s "$ASK_SKILL_ID" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); \
+im=d.get('interactionModel',{}).get('pt-BR',{}).get('lastUpdateRequest',{}); \
+mf=d.get('manifest',{}).get('lastUpdateRequest',{}); \
+print('MODEL:', im.get('status'), '| MANIFEST:', mf.get('status'))"
+# esperado: MODEL: SUCCEEDED | MANIFEST: SUCCEEDED (erros: null)
+
+# 4) Skill habilitada para a conta do Echo (204/vazio = habilitado)
+docker exec idiota-ask ask smapi get-skill-enablement-status -s "$ASK_SKILL_ID" -g development && echo "habilitada ✓"
+```
+
+Checklist de aceite (todos obrigatórios):
+
+- [ ] CI `success`
+- [ ] CodeCommit head = commit "deploy: <sha deste push>"
+- [ ] `MODEL: SUCCEEDED` e `MANIFEST: SUCCEEDED`
+- [ ] enablement ativo (HTTP 204)
+- [ ] Teste de voz no Echo: **"Alexa, abre Idiota"** → saudação; funcionalidade
+      nova do deploy confirmada (ex.: *"quais são meus e-mails?"* / ditado / conversa)
+
+SMAPI **simulation** (`simulate-skill`) NÃO serve de verificação nesta conta
+(retorna "An unexpected error occurred" sempre) — o teste real é o Echo.
